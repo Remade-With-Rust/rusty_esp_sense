@@ -185,6 +185,10 @@ pub struct BenchConfig {
     pub fit: FitConfig,
     /// Folds of whole captures.
     pub folds: usize,
+    /// Fits run at once (the folds and the confound); 0 runs them all at
+    /// once. Each holds its training set, features and Gram matrix while it
+    /// runs, so this bounds peak memory; the results do not depend on it.
+    pub fit_jobs: usize,
 }
 
 impl Default for BenchConfig {
@@ -193,6 +197,7 @@ impl Default for BenchConfig {
             window: WindowConfig::DEFAULT,
             fit: FitConfig::DEFAULT,
             folds: 5,
+            fit_jobs: 0,
         }
     }
 }
@@ -502,9 +507,14 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
             .collect();
         jobs.push((true, e12, later));
     }
-    let scored: Vec<crate::Result<(bool, Calls)>> = jobs
-        .par_iter()
-        .map(|(confound, train, test)| {
+    let at_once = if cfg.fit_jobs == 0 {
+        jobs.len().max(1)
+    } else {
+        cfg.fit_jobs
+    };
+    let mut scored: Vec<crate::Result<(bool, Calls)>> = Vec::with_capacity(jobs.len());
+    for batch in jobs.chunks(at_once) {
+        scored.par_extend(batch.par_iter().map(|(confound, train, test)| {
             let model = fit_on(train, subcarriers, cfg, encoder.as_ref())?;
             let calls = called_occupied(&model, test)?;
             let rows = test
@@ -513,8 +523,8 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
                 .map(|(p, c)| (p.scenario, c))
                 .collect();
             Ok((*confound, rows))
-        })
-        .collect();
+        }));
+    }
     let mut held = Vec::new();
     let mut confound = Vec::new();
     for r in scored {
@@ -572,6 +582,89 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
 mod tests {
     use super::*;
 
+    /// Synthetic recordings for all four scenarios, through the capture
+    /// parser: occupied scenarios wobble their amplitudes, empty ones hold.
+    fn synthetic() -> Vec<Recording> {
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut out = Vec::new();
+        for (si, &scenario) in Scenario::ALL.iter().enumerate() {
+            for c in 0..5 {
+                let mut text = String::new();
+                for _ in 0..120 {
+                    text.push_str("CSI_DATA,-40,128");
+                    for k in 0..128 {
+                        let v = if k % 2 == 0 {
+                            let wobble = if scenario.occupied() {
+                                next() % 13
+                            } else {
+                                next() % 2
+                            };
+                            20 + (k % 7) as i64 + wobble as i64
+                        } else {
+                            0
+                        };
+                        text.push_str(&format!(",{v}"));
+                    }
+                    text.push('\n');
+                }
+                out.push(Recording {
+                    scenario,
+                    day: format!("2026050{si}"),
+                    capture: capture::parse(
+                        &format!("s{si}c{c}"),
+                        &text,
+                        TAG_C6_HT20_NATURAL,
+                        FRAME_US,
+                    ),
+                });
+            }
+        }
+        out
+    }
+
+    /// The parallel benchmark's report does not depend on how many fits run
+    /// at once, nor on the pool's size: every job's result is kept apart and
+    /// concatenated in job order.
+    #[test]
+    fn the_report_does_not_depend_on_fit_jobs_or_threads() {
+        let recs = synthetic();
+        let cfg = |fit_jobs| BenchConfig {
+            window: WindowConfig {
+                frames: 10,
+                centre: true,
+                wander: true,
+            },
+            fit: FitConfig {
+                features: 16,
+                ..FitConfig::DEFAULT
+            },
+            folds: 5,
+            fit_jobs,
+        };
+        let report = |threads: usize, fit_jobs: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| format!("{:?}", run(&recs, &cfg(fit_jobs)).unwrap()))
+        };
+        let want = report(1, 1);
+        assert!(want.contains("held_out"), "{want}");
+        for (threads, fit_jobs) in [(1, 0), (4, 0), (4, 1), (4, 2), (4, 6)] {
+            assert_eq!(
+                report(threads, fit_jobs),
+                want,
+                "threads {threads}, fit_jobs {fit_jobs}"
+            );
+        }
+    }
+
     /// The oracle for R2: a model fitted on data and the zero-valued one of
     /// the same shape save to files of identical size, raw window or wander,
     /// with or without the encoder.
@@ -590,6 +683,7 @@ mod tests {
                     ..FitConfig::DEFAULT
                 },
                 folds: 5,
+                fit_jobs: 0,
             };
             let s = 6;
             let w = window.width(s);

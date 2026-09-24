@@ -2,7 +2,7 @@
 //! Cuenca benchmark.
 //!
 //! ```text
-//! rusty_esp_sense bench-cuenca <dataset-dir> [--frames N] [--features D] [--alpha A] [--folds K] [--no-centre] [--raw-window]
+//! rusty_esp_sense bench-cuenca <dataset-dir> [--frames N] [--features D] [--alpha A] [--folds K] [--fit-jobs J] [--no-centre] [--raw-window]
 //! rusty_esp_sense fit --out room.safetensors [--layout L] [--frames N] [--features D] [--alpha A] [--no-centre] [--raw-window] LABEL=a.csv[,b.csv] …
 //! rusty_esp_sense run --model room.safetensors [--layout L] recording.csv
 //! rusty_esp_sense watch --model room.safetensors [--bridge] [--for SECS] <janus1 ticket>   (feature `live`)
@@ -13,6 +13,13 @@
 //! not say which training field was captured, so `--layout` does: `lltf`
 //! (the default, and what a C10 sends), `ht`, `c6` (the C6's natural HT20
 //! order, the Cuenca dataset's), or `dense`.
+//!
+//! Every command takes `--threads N`: the size of the pool that parses
+//! captures, prepares recordings, runs the benchmark's fits side by side and
+//! runs the matrix multiplies (the default is one per logical CPU, or
+//! `RAYON_NUM_THREADS`). Results do not depend on it -- only time and peak
+//! memory do; `bench-cuenca --fit-jobs J` bounds how many fits hold their
+//! buffers at once.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -26,13 +33,14 @@ use rusty_esp_signal_core::radar::csi_stream::{
 };
 
 const USAGE: &str = "usage:
-  rusty_esp_sense bench-cuenca <dataset-dir> [--frames N] [--features D] [--alpha A] [--folds K] [--no-centre] [--raw-window]
+  rusty_esp_sense bench-cuenca <dataset-dir> [--frames N] [--features D] [--alpha A] [--folds K] [--fit-jobs J] [--no-centre] [--raw-window]
   rusty_esp_sense fit --out room.safetensors [--layout lltf|ht|c6|dense] [--frames N] [--features D] [--alpha A] [--no-centre] [--raw-window] LABEL=a.csv[,b.csv] ...
   rusty_esp_sense run --model room.safetensors [--layout lltf|ht|c6|dense] recording.csv
   rusty_esp_sense bench-fall <dataset-dir> [--burst PERMILLE]
   rusty_esp_sense night [--layout lltf|ht|c6|dense] recording.csv
   rusty_esp_sense bench-night <dataset-dir>
-  rusty_esp_sense watch --model room.safetensors [--bridge] [--for SECS] <janus1 ticket>   (built with --features live)";
+  rusty_esp_sense watch --model room.safetensors [--bridge] [--for SECS] <janus1 ticket>   (built with --features live)
+every command: [--threads N]  (default: one per logical CPU; results do not depend on it)";
 
 struct Args {
     rest: Vec<String>,
@@ -161,6 +169,23 @@ fn real_main() -> ExitCode {
     }
     let cmd = all.remove(0);
     let mut args = Args { rest: all };
+    match args.num("--threads", 0usize) {
+        // The one pool every parallel step and every multiply runs on.
+        Ok(0) => {}
+        Ok(n) => {
+            if let Err(e) = rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build_global()
+            {
+                eprintln!("rusty_esp_sense: --threads {n}: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+        Err(e) => {
+            eprintln!("rusty_esp_sense: {e}");
+            return ExitCode::from(2);
+        }
+    }
     let result = match cmd.as_str() {
         "bench-cuenca" => bench_cuenca(&mut args),
         "fit" => fit(&mut args),
@@ -214,6 +239,7 @@ fn bench_cuenca(args: &mut Args) -> Result<(), String> {
         window: args.window()?,
         fit: args.fit()?,
         folds: args.num("--folds", 5)?,
+        fit_jobs: args.num("--fit-jobs", 0)?,
     };
     let dir = args.rest.first().cloned().ok_or_else(|| USAGE.to_owned())?;
     let started = std::time::Instant::now();
