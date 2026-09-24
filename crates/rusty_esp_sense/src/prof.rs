@@ -192,7 +192,12 @@ mod imp {
     #[must_use]
     pub fn dump() -> String {
         let total = NS[Stage::Total as usize].load(Relaxed).max(1) as f64;
-        let mut s = String::from("stage            ms        %      calls\n");
+        // Stages add up time from every thread (CPU time); Total is the
+        // top of the command (wall time). With parallel steps the stages
+        // can sum past Total, and the residue then reads zero.
+        let mut s = String::from(
+            "stage            ms        %      calls   (stages: summed over threads; Total: wall)\n",
+        );
         let mut named = 0u64;
         for st in STAGES {
             let ns = NS[st as usize].load(Relaxed);

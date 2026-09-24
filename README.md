@@ -116,6 +116,14 @@ let model = Model::fit(&w.data, &labels, vec!["empty".into(), "occupied".into()]
 model.save("room.safetensors".as_ref())?;
 ```
 
+**Threads.** Captures are parsed and windowed in parallel, and the
+benchmark fits its folds side by side. Every command takes `--threads N`;
+the default is one thread per logical CPU, or `RAYON_NUM_THREADS`. Results
+do not depend on the thread count, only time and memory do.
+`bench-cuenca --fit-jobs J` caps how many fits run at once, to bound peak
+memory: in the raw-window configuration, 664 MB with all six at once and
+264 MB one at a time.
+
 **Calibrate with the room's normal network traffic running.** Calibrated on
 four minutes without traffic, it called 13 of 60 windows of a 10 Mbps
 capture occupied.
@@ -125,6 +133,10 @@ capture occupied.
 On the home computer or any LAN box — not on the device. It reads what the
 device's `csi-stream` output sends (raw I/Q, ~7 KB/s at 50 Hz), so a model
 can be recalibrated or replaced without reflashing anything.
+
+The whole 100-capture Cuenca benchmark runs in about 0.27 s on a 24-thread
+desktop, against 3.7 s single-threaded before optimisation. Every step,
+including the parallelism, is byte-identical: [docs/PERF.md](docs/PERF.md).
 
 The tensors are [candle](https://github.com/huggingface/candle), CPU only.
 `candle-core` 0.11 takes `tokenizers` with its `onig` feature, so a native

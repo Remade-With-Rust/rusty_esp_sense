@@ -284,3 +284,74 @@ The curve is flat, so the solve is no longer memory-bound.
 - **Work can move between scopes.** C8 moved a conversion from unscoped
   time into RidgeStd, so the scoped sum rose while the total fell. When
   work moves between scopes, time the whole command.
+
+# Parallelism
+
+Seven more commits, P1 to P7, spread independent work across threads.
+Each keeps results in order, so the output does not depend on the thread
+count. Every commit passed the golden gate at 24, 4 and 1 threads, and a
+unit test compares the benchmark report across pool sizes and `--fit-jobs`
+settings.
+
+| commit | independent unit | ordered by | evidence, 24 threads |
+|---|---|---|---|
+| P1 | each capture's parse | the folder walk | bench-cuenca 1,100 → 856 ms, 7/8; bench-fall 1,236 → 724 ms, 8/8 |
+| P2 | each recording's windows and detector calls | recording order | 955 → 605 ms, 8/8 |
+| P3 | the five folds and the confound fit | job order, confound last | 646 → 337 ms, 8/8; raw 1,110 → 640 ms, 6/6 |
+| P4 | `--threads N`, `--fit-jobs J` | | both reproduce the golden output |
+| P5 | the fall benchmark's per-capture detector pass | recording order | 397 → 63 ms, 8/8 |
+| P6 | the night benchmark's four scenarios | scenario order | 1,632 → 821 ms, 8/8 |
+| P7 | `fit`'s per-file read and windows | file order | 12 files: 99 → 53 ms, 8/8 |
+
+In each case the first error in sequential order is the one returned, and
+the per-file messages print in the same order as before.
+
+## Scaling, before P1 and after P7
+
+Wall time, median of 3 per point. Before P1, only candle's matrix
+multiplies used threads.
+
+| threads | cuenca before | cuenca after | raw before | raw after | fall before | fall after | night before | night after |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1,825 | 1,801 | 4,263 | 4,182 | 668 | 695 | 1,800 | 2,056 |
+| 2 | 1,516 | 958 | 2,832 | 2,148 | 638 | 350 | 2,016 | 1,117 |
+| 4 | 1,266 | 565 | 2,084 | 1,641 | 622 | 199 | 1,750 | 947 |
+| 8 | 1,200 | 338 | 1,993 | 1,010 | 617 | 116 | 1,729 | 878 |
+| 16 | 1,277 | 280 | 1,954 | 680 | 608 | 84 | 1,777 | 863 |
+| 24 | 1,152 | 269 | 1,779 | 668 | 611 | 69 | 1,840 | 867 |
+
+The one-thread column is the same code path on both sides; its spread is
+the day's machine noise.
+
+**What still limits it:**
+
+- **The night benchmark** is capped by its largest scenario. E3 holds 45
+  of the 100 captures and is one night played through stateful
+  estimators. Splitting that stream would change the estimators' state and
+  therefore the output.
+- **bench-cuenca** flattens from 16 threads. Six fits share the pool, and
+  the longest fit's sequential Cholesky and its multiplies set the floor.
+
+## Memory
+
+Running fits side by side holds their buffers at once. `--fit-jobs`
+trades that back. `--raw-window` at 24 threads, one run each:
+
+| fit-jobs | time | peak |
+|---:|---:|---:|
+| 0, all six at once | 635 ms | 664 MB |
+| 3 | 696 ms | 424 MB |
+| 2 | 779 ms | 356 MB |
+| 1 | 1,159 ms | 264 MB |
+
+The default configuration peaks at about 472 MB with all fits at once,
+against 165 MB before P3.
+
+## Reading the profiler under threads
+
+Stage times add up every thread's time, so they measure CPU. Total is the
+command's wall time. Under parallelism the stages can sum past Total and
+the residue reads zero, and the dump's header now says so. Verdicts in this
+section come from the whole command's wall time, in alternating pairs.
+The allocation census is deterministic only at one thread; at 24 threads
+its peak varies from run to run.
