@@ -218,7 +218,37 @@ fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
         }
         let ljj = s.sqrt();
         a[j * d + j] = ljj;
-        for i in j + 1..d {
+        // Four rows at once: four independent accumulators, each summed in
+        // its own row's order exactly as below, sharing each load of row j.
+        // Vertical, not reassociated -- bit for bit the one-row loop.
+        let mut i = j + 1;
+        while i + 4 <= d {
+            let s = {
+                let rj = &a[j * d..j * d + j];
+                let r0 = &a[i * d..i * d + j];
+                let r1 = &a[(i + 1) * d..(i + 1) * d + j];
+                let r2 = &a[(i + 2) * d..(i + 2) * d + j];
+                let r3 = &a[(i + 3) * d..(i + 3) * d + j];
+                let mut s = [
+                    a[i * d + j],
+                    a[(i + 1) * d + j],
+                    a[(i + 2) * d + j],
+                    a[(i + 3) * d + j],
+                ];
+                for ((((&y, &x0), &x1), &x2), &x3) in rj.iter().zip(r0).zip(r1).zip(r2).zip(r3) {
+                    s[0] -= x0 * y;
+                    s[1] -= x1 * y;
+                    s[2] -= x2 * y;
+                    s[3] -= x3 * y;
+                }
+                s
+            };
+            for (r, v) in s.iter().enumerate() {
+                a[(i + r) * d + j] = v / ljj;
+            }
+            i += 4;
+        }
+        for i in i..d {
             // Both rows' prefixes as slices, zipped: the same order, no
             // bounds check per trip; the write waits until they are done.
             let s = {
