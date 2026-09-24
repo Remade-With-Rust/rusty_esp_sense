@@ -44,18 +44,32 @@ impl Standardize {
         })
     }
 
-    /// `(x - mean) / std`.
+    /// `(x - mean) / std`, for an `[n, d]` tensor.
+    ///
+    /// One pass into one buffer: the same two `f32` operations per element,
+    /// in the same order, as the broadcast subtract and divide it replaces --
+    /// which built a mean tensor, a std tensor and an intermediate of the
+    /// whole input on every call.
     ///
     /// # Errors
     ///
     /// A tensor error when `x`'s width is not this one's.
     pub fn apply(&self, x: &Tensor) -> crate::Result<Tensor> {
         let _g = prof::scope(Stage::InputStd);
-        prof::add(Counter::TensorBuilds, 2);
-        let d = self.mean.len();
-        let mean = Tensor::from_slice(&self.mean, d, &Device::Cpu)?;
-        let std = Tensor::from_slice(&self.std, d, &Device::Cpu)?;
-        Ok(x.broadcast_sub(&mean)?.broadcast_div(&std)?)
+        let (n, d) = x.dims2()?;
+        if d != self.mean.len() {
+            return Err(crate::Error::Input(format!(
+                "standardise: {d} columns, fitted on {}",
+                self.mean.len()
+            )));
+        }
+        let mut v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        for row in v.chunks_exact_mut(d) {
+            for ((e, &m), &s) in row.iter_mut().zip(&self.mean).zip(&self.std) {
+                *e = (*e - m) / s;
+            }
+        }
+        Ok(Tensor::from_vec(v, (n, d), &Device::Cpu)?)
     }
 }
 
