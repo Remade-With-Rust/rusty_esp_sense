@@ -355,3 +355,42 @@ the residue reads zero, and the dump's header now says so. Verdicts in this
 section come from the whole command's wall time, in alternating pairs.
 The allocation census is deterministic only at one thread; at 24 threads
 its peak varies from run to run.
+
+# Inside the parallel functions: ten deterministic wins
+
+Q1 to Q10 cut work inside the functions P1 to P7 parallelised. Every one
+passed the golden gate at 24, 4 and 1 threads, and each is judged on a
+deterministic count from the single-thread census.
+
+| win | where | what stopped | evidence |
+|---|---|---|---|
+| Q1 | `prepare` (P2) | windows and calls grown by doubling | −700 allocations |
+| Q2 | `fit_on` (P3) | the training gather grown by doubling | −130 allocations, −1.5 MB |
+| Q3 | `called_occupied` (P3) | test rows collected through a zero size hint | −31 allocations, −269 KB |
+| Q4 | `Model::fit` (P3) | one-hot targets collected through a zero size hint | −71 allocations, −515 KB |
+| Q5 | `lower_gram` (P3) | every Gram panel copied out, then copied in | −192 allocations, −28.3 MB |
+| Q6 | `run` after P2 | every recording's detector calls cloned to be counted | −100 allocations |
+| Q7 | the night benchmark (P6), `epochs` | every sample copied to change its timestamp | sample copies 296,035 → 0 |
+| Q8 | `wander`, every window (P2, P7) | a heap vector of means per window | −5,804 allocations |
+| Q9 | `prepare` (P2) | a heap vector per window | −5,904 allocations |
+| Q10 | `fit` (P7) | a heap vector per window, per file | `fit` −128; 12 files 2,119 → 598 |
+
+**bench-cuenca's single-thread allocations went from 16,921 to 3,989
+(−76 %).** Its bytes allocated fell by 32.3 MB.
+
+**Wall time is flat.** bench-cuenca against P7 read 6/10 pairs at 24
+threads and 7/10 at one thread. The multiplies dominate, and these counts
+were small next to them.
+
+**Q7 first regressed and was fixed.** Its first form fed the stateful loop
+through a generic `(time, sample)` iterator: `flat_map` over the captures,
+`peekable`, borrowed. It removed the copies but ran 1.7 % slower (2/20
+pairs, z −3.58). Moving the loop body into `EpochBuilder`, fed from plain
+nested loops, kept the copies at zero and restored the time (11/20,
+ratio 0.993). **A count that falls is not a win until the level above it
+has been timed.**
+
+**Census outliers.** Twice the harness's first reading after a build
+moved about 20 MB in a path the change did not touch. Three reruns
+reproduced the previous figure both times. Rerun any census delta a
+change cannot explain before recording it.
