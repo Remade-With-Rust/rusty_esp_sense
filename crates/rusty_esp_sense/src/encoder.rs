@@ -86,7 +86,19 @@ impl RandomFeatures {
             Counter::EncodeMacs,
             (x.dim(0)? * self.input * self.output) as u64,
         );
-        Ok(x.matmul(&self.w.t()?)?.broadcast_add(&self.b)?.relu()?)
+        // The bias and the ReLU in place over the product: the same f32 add
+        // and the same max with zero, per element, where the broadcast add
+        // and relu each built another tensor the size of the product.
+        let y = x.matmul(&self.w.t()?)?;
+        let (n, width) = y.dims2()?;
+        let b: Vec<f32> = self.b.to_vec1()?;
+        let mut v: Vec<f32> = y.flatten_all()?.to_vec1()?;
+        for row in v.chunks_exact_mut(width) {
+            for (e, &bias) in row.iter_mut().zip(&b) {
+                *e = (*e + bias).max(0.0);
+            }
+        }
+        Ok(Tensor::from_vec(v, (n, width), &Device::Cpu)?)
     }
 }
 
