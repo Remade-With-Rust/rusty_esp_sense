@@ -29,6 +29,9 @@ const USAGE: &str = "usage:
   rusty_esp_sense bench-cuenca <dataset-dir> [--frames N] [--features D] [--alpha A] [--folds K] [--no-centre] [--raw-window]
   rusty_esp_sense fit --out room.safetensors [--layout lltf|ht|c6|dense] [--frames N] [--features D] [--alpha A] [--no-centre] [--raw-window] LABEL=a.csv[,b.csv] ...
   rusty_esp_sense run --model room.safetensors [--layout lltf|ht|c6|dense] recording.csv
+  rusty_esp_sense bench-fall <dataset-dir> [--burst PERMILLE]
+  rusty_esp_sense night [--layout lltf|ht|c6|dense] recording.csv
+  rusty_esp_sense bench-night <dataset-dir>
   rusty_esp_sense watch --model room.safetensors [--bridge] [--for SECS] <janus1 ticket>   (built with --features live)";
 
 struct Args {
@@ -104,6 +107,9 @@ fn main() -> ExitCode {
         "bench-cuenca" => bench_cuenca(&mut args),
         "fit" => fit(&mut args),
         "run" => run(&mut args),
+        "bench-fall" => bench_fall(&mut args),
+        "night" => night(&mut args),
+        "bench-night" => bench_night(&mut args),
         #[cfg(feature = "live")]
         "watch" => watch(&mut args),
         _ => Err(USAGE.to_owned()),
@@ -377,4 +383,137 @@ fn watch(args: &mut Args) -> Result<(), String> {
         );
         Ok::<(), String>(())
     })
+}
+
+fn bench_fall(args: &mut Args) -> Result<(), String> {
+    let burst: Option<u16> = match args.take("--burst") {
+        Some(v) => Some(
+            v.parse()
+                .map_err(|_| format!("--burst {v}: not a number"))?,
+        ),
+        None => None,
+    };
+    let dir = args.rest.first().cloned().ok_or_else(|| USAGE.to_owned())?;
+    let recs = bench::load(Path::new(&dir)).map_err(|e| e.to_string())?;
+    let r = rusty_esp_sense::fall_bench::run(&recs, burst);
+    println!(
+        "fall benchmark: {} captures, split in halves within each scenario",
+        recs.len()
+    );
+    println!("tuning half, the highest one-second wander the on-chip detector reports:");
+    for (s, m) in &r.tuning_max {
+        println!("  {:<22} {m} permille", s.name());
+    }
+    println!(
+        "test half: {:.2} h of channel state, burst threshold {} permille: {} false events",
+        r.test_hours, r.burst, r.false_events
+    );
+    if r.first_false_at > 0 {
+        println!(
+            "  the first false event on the test half appears at a threshold of {} permille",
+            r.first_false_at
+        );
+    } else {
+        println!(
+            "  no false event on the test half at any threshold down to the presence threshold"
+        );
+    }
+    println!(
+        "splices (SYNTHETIC: real walking wander, a half-second burst, real empty-room wander): {}/{} raised",
+        r.splice_falls.0, r.splice_falls.1
+    );
+    println!(
+        "splices with no burst (walking, then an empty room: someone leaving): {}/{} raised",
+        r.splice_leaves.0, r.splice_leaves.1
+    );
+    Ok(())
+}
+
+fn night(args: &mut Args) -> Result<(), String> {
+    use rusty_esp_sense::sleep::{self, NightConfig};
+    let layout = args.layout()?;
+    let f = args.rest.first().ok_or_else(|| USAGE.to_owned())?;
+    let c = capture::read(Path::new(f), layout, bench::FRAME_US).map_err(|e| e.to_string())?;
+    let cfg = NightConfig::DEFAULT;
+    let epochs = sleep::epochs(&c.samples, &cfg);
+    let states = sleep::score(&epochs, &cfg);
+    for (e, s) in epochs.iter().zip(&states) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "start_s": e.start.0 as f64 / 1e6,
+                "state": s.word(),
+                "motion": e.motion,
+                "breathing_bpm": e.breathing_bpm_x10.map(|b| f64::from(b) / 10.0),
+                "breathing_confidence": e.breathing_confidence,
+            })
+        );
+    }
+    let sum = sleep::summarise(&epochs, &states, &cfg);
+    println!(
+        "{}",
+        serde_json::json!({
+            "summary": {
+                "epochs": sum.epochs,
+                "in_room_min": sum.in_room_min,
+                "asleep_min": sum.asleep_min,
+                "onset_min": sum.onset_min,
+                "awake_after_onset_min": sum.awake_after_onset_min,
+                "efficiency": sum.efficiency,
+                "awakenings": sum.awakenings,
+                "asleep_breathing_bpm": sum.asleep_breathing_bpm,
+            }
+        })
+    );
+    Ok(())
+}
+
+/// Each Cuenca scenario played back as one continuous stretch -- its
+/// captures end to end -- and scored as a night. None of them is a night:
+/// the point is what an empty room and a walking person are scored AS. An
+/// empty room scored asleep is the failure that matters.
+fn bench_night(args: &mut Args) -> Result<(), String> {
+    use rusty_esp_sense::bench::Scenario;
+    use rusty_esp_sense::sleep::{self, NightConfig, State};
+    use rusty_esp_signal_core::esp_core::Micros;
+    let dir = args.rest.first().cloned().ok_or_else(|| USAGE.to_owned())?;
+    let recs = bench::load(Path::new(&dir)).map_err(|e| e.to_string())?;
+    let cfg = NightConfig::DEFAULT;
+    println!(
+        "night benchmark: each scenario's captures played end to end, scored in {} s epochs",
+        cfg.epoch.0 / 1_000_000
+    );
+    println!("  scenario                epochs   empty   awake  asleep  breathing accepted");
+    for s in Scenario::ALL {
+        let mut all = Vec::new();
+        let mut offset = 0u64;
+        for r in recs.iter().filter(|r| r.scenario == s) {
+            let base = r.capture.samples.first().map_or(0, |x| x.at.0);
+            let mut end = offset;
+            for x in &r.capture.samples {
+                let mut y = *x;
+                y.at = Micros(offset + (x.at.0 - base));
+                end = y.at.0;
+                all.push(y);
+            }
+            offset = end + bench::FRAME_US;
+        }
+        let epochs = sleep::epochs(&all, &cfg);
+        let states = sleep::score(&epochs, &cfg);
+        let count = |k: State| states.iter().filter(|&&x| x == k).count();
+        let breathed = epochs
+            .iter()
+            .filter(|e| e.breathing_bpm_x10.is_some())
+            .count();
+        println!(
+            "  {:<22} {:>7} {:>7} {:>7} {:>7}  {breathed}/{}",
+            s.name(),
+            states.len(),
+            count(State::Empty),
+            count(State::Awake),
+            count(State::Asleep),
+            epochs.len()
+        );
+    }
+    Ok(())
 }

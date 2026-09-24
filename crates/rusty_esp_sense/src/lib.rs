@@ -38,9 +38,11 @@
 pub mod bench;
 pub mod capture;
 pub mod encoder;
+pub mod fall_bench;
 pub mod metrics;
 pub mod model;
 pub mod readout;
+pub mod sleep;
 pub mod window;
 
 /// What can go wrong.

@@ -50,6 +50,34 @@ else's bench, with a different subcarrier layout from our own devices, and
 its labels are per capture. Every number, with the run that produced it:
 [`docs/LEDGER.md`](https://github.com/Remade-With-Rust/rusty_esp_sense/blob/main/docs/LEDGER.md).
 
+## Falls and nights (W7)
+
+**A fall is a shape**: moving, a burst above anything walking does, then
+stillness that lasts. The detector is `rusty_esp_signal-core::radar::fall`
+and runs on the chip; `bench-fall` is its evidence. With its thresholds set
+on half the captures, the other half — 0.84 h of real walking, traffic and
+empty room — raised **0 false falls**, and none until the burst threshold
+was lowered from 232 ‰ to 114 ‰. On synthetic splices of real segments it
+raised 10/10 falls and 0/10 "walked out of the room". **No real fall has
+been recorded**, so no detection rate is claimed, and 0 events in 0.84 h
+bounds false alarms only below ~3.6 an hour.
+
+**A night is epochs**: 30 s each, empty / awake / asleep. Awake by
+actigraphy's rule on motion; still epochs are asleep only when a breath
+was accepted within a minute and a half, and empty otherwise — an empty
+bed and a still sleeper read the same amplitude. `bench-night` plays each
+Cuenca scenario back end to end: **0 of 122 empty-room epochs scored
+asleep** (31 empty, 91 empty with traffic), every walking epoch awake. The
+estimator accepted no breath in any of it, so the *asleep* path has not
+met real data yet, and there are no sleep stages — those need a sleep
+study to label.
+
+```sh
+rusty_esp_sense night recording.csv        # one JSON line per epoch, then a summary
+rusty_esp_sense bench-fall <dataset-dir>
+rusty_esp_sense bench-night <dataset-dir>
+```
+
 ## Why not RuView's weights
 
 RuView's released MM-Fi model takes `[3 antennas, 114 subcarriers, 10
