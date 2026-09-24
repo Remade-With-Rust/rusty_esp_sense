@@ -77,6 +77,23 @@ fn most_active(stream: &Stream, len: usize, active: u16) -> &[(Micros, u16)] {
     &stream[at..at + len]
 }
 
+/// Whether a detector with `config` raises any event over `stream`,
+/// stopping at the first: the sweep asks only that, and [`events`] ran every
+/// stream to its end to count what `> 0` then threw away.
+#[must_use]
+pub fn raises_any(stream: &Stream, config: FallConfig) -> bool {
+    let _g = prof::scope(Stage::Fall);
+    let mut d = FallDetector::new(config);
+    for (i, &(t, w)) in stream.iter().enumerate() {
+        if d.push(w, t).is_some() {
+            prof::add(Counter::FallPushes, i as u64 + 1);
+            return true;
+        }
+    }
+    prof::add(Counter::FallPushes, stream.len() as u64);
+    false
+}
+
 /// What the fall benchmark found.
 #[derive(Debug, Clone)]
 pub struct FallReport {
@@ -179,7 +196,7 @@ pub fn run(recordings: &[Recording], burst: Option<u16>) -> FallReport {
             if test
                 .iter()
                 .zip(&peaks)
-                .any(|((_, st), &peak)| peak >= b && events(st, c) > 0)
+                .any(|((_, st), &peak)| peak >= b && raises_any(st, c))
             {
                 first_false_at = b;
                 break;
@@ -323,6 +340,29 @@ mod tests {
         let s = stream(&[(3, 10), (2, 90), (3, 10)]);
         let seg = most_active(&s, 100, 32);
         assert!(seg.iter().all(|x| x.1 == 90), "{:?}", &seg[..3]);
+    }
+
+    /// R9's oracle: `raises_any` is `events > 0`, over streams with no
+    /// event, one, and several.
+    #[test]
+    fn raises_any_is_events_above_zero() {
+        let c = FallConfig::normalised_default();
+        let fall = [(5, 60), (1, 400), (15, 18)];
+        let two: Vec<(u64, u16)> = fall
+            .iter()
+            .chain(&[(61, 18)])
+            .chain(&fall)
+            .copied()
+            .collect();
+        for st in [
+            stream(&[(20, 17)]),
+            stream(&[(5, 60), (15, 18)]),
+            stream(&fall),
+            stream(&two),
+        ] {
+            assert_eq!(raises_any(&st, c), events(&st, c) > 0);
+        }
+        assert_eq!(events(&stream(&two), c), 2);
     }
 
     #[test]
