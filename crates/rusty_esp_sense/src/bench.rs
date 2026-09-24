@@ -428,8 +428,14 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
     let mut prepared = Vec::with_capacity(recordings.len());
     let mut per_scenario = [0usize; 4];
     let mut counts = Vec::new();
-    for r in recordings {
-        let (w, detector) = prepare(&r.capture, cfg.window);
+    // Each recording's windows and detector calls depend on that recording
+    // alone: prepared in parallel, collected in order. The checks and the
+    // fold numbering below still run over them in recording order.
+    let windowed: Vec<(Windows, Vec<bool>)> = recordings
+        .par_iter()
+        .map(|r| prepare(&r.capture, cfg.window))
+        .collect();
+    for (r, (w, detector)) in recordings.iter().zip(windowed) {
         if subcarriers == 0 {
             subcarriers = w.subcarriers;
         }
