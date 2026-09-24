@@ -323,13 +323,13 @@ fn prepare(c: &Capture, cfg: WindowConfig) -> (Windows, Vec<bool>) {
     (w, calls)
 }
 
-fn table(rows: &[(Scenario, Vec<bool>)]) -> Table {
+fn table<C: AsRef<[bool]>>(rows: &[(Scenario, C)]) -> Table {
     Scenario::ALL
         .iter()
         .map(|&s| {
             let mut t = Tally::default();
             for (_, calls) in rows.iter().filter(|(r, _)| *r == s) {
-                t.add(calls);
+                t.add(calls.as_ref());
             }
             (s, t)
         })
@@ -557,9 +557,11 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
     let model_bytes = std::fs::metadata(&path)?.len();
     let _ = std::fs::remove_file(&path);
 
-    let detector: Vec<(Scenario, Vec<bool>)> = prepared
+    // Borrowed: every recording's detector calls were cloned only to be
+    // counted.
+    let detector: Vec<(Scenario, &[bool])> = prepared
         .iter()
-        .map(|p| (p.scenario, p.detector.clone()))
+        .map(|p| (p.scenario, p.detector.as_slice()))
         .collect();
     let days = Scenario::ALL
         .iter()
