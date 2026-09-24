@@ -94,11 +94,18 @@ impl RandomFeatures {
         let b: Vec<f32> = self.b.to_vec1()?;
         let mut v: Vec<f32> = y.flatten_all()?.to_vec1()?;
         for row in v.chunks_exact_mut(width) {
-            for (e, &bias) in row.iter_mut().zip(&b) {
-                *e = (*e + bias).max(0.0);
-            }
+            bias_relu(row, &b);
         }
         Ok(Tensor::from_vec(v, (n, width), &Device::Cpu)?)
+    }
+}
+
+/// `row[j] = max(row[j] + b[j], 0)`, per element. Its own frame so the two
+/// slices arrive as non-aliasing parameters and the loop is packed.
+#[inline(never)]
+fn bias_relu(row: &mut [f32], b: &[f32]) {
+    for (e, &bias) in row.iter_mut().zip(b) {
+        *e = (*e + bias).max(0.0);
     }
 }
 
