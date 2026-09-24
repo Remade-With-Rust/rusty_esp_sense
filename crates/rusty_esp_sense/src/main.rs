@@ -292,14 +292,19 @@ fn fit(args: &mut Args) -> Result<(), String> {
     let layout = args.layout()?;
     let win = args.window()?;
     let cfg = args.fit()?;
+    // The label specs, in order, name the files; a malformed spec ends the
+    // list there, as it ended the sequential loop. Each file's read and
+    // windows depend on that file alone, so they run in parallel; the
+    // checks, the messages and the training set then follow in file order,
+    // and the first failure in that order is the one returned.
     let mut labels: Vec<String> = Vec::new();
-    let mut data = Vec::new();
-    let mut targets = Vec::new();
-    let mut subcarriers = 0usize;
+    let mut jobs: Vec<(usize, &str, &str)> = Vec::new();
+    let mut bad_spec = None;
     for spec in &args.rest {
-        let (label, files) = spec
-            .split_once('=')
-            .ok_or_else(|| format!("{spec}: LABEL=file.csv[,file.csv]"))?;
+        let Some((label, files)) = spec.split_once('=') else {
+            bad_spec = Some(format!("{spec}: LABEL=file.csv[,file.csv]"));
+            break;
+        };
         let idx = match labels.iter().position(|l| l == label) {
             Some(i) => i,
             None => {
@@ -308,27 +313,41 @@ fn fit(args: &mut Args) -> Result<(), String> {
             }
         };
         for f in files.split(',') {
+            jobs.push((idx, label, f));
+        }
+    }
+    let read: Vec<Result<(usize, window::Windows), String>> = jobs
+        .par_iter()
+        .map(|&(_, _, f)| {
             let c = capture::read(&PathBuf::from(f), layout, bench::FRAME_US)
                 .map_err(|e| format!("{f}: {e}"))?;
-            let w = window::windows(&c.samples, win);
-            if subcarriers == 0 {
-                subcarriers = w.subcarriers;
-            }
-            if w.subcarriers != subcarriers {
-                return Err(format!(
-                    "{f}: {} subcarriers, the rest {subcarriers}",
-                    w.subcarriers
-                ));
-            }
-            eprintln!(
-                "{label}: {f}: {} windows ({} rows refused, {} frames skipped)",
-                w.data.len(),
-                c.rejected,
-                w.skipped
-            );
-            targets.extend(std::iter::repeat_n(idx, w.data.len()));
-            data.extend(w.data);
+            Ok((c.rejected, window::windows(&c.samples, win)))
+        })
+        .collect();
+    let mut data = Vec::new();
+    let mut targets = Vec::new();
+    let mut subcarriers = 0usize;
+    for (&(idx, label, f), r) in jobs.iter().zip(read) {
+        let (rejected, w) = r?;
+        if subcarriers == 0 {
+            subcarriers = w.subcarriers;
         }
+        if w.subcarriers != subcarriers {
+            return Err(format!(
+                "{f}: {} subcarriers, the rest {subcarriers}",
+                w.subcarriers
+            ));
+        }
+        eprintln!(
+            "{label}: {f}: {} windows ({rejected} rows refused, {} frames skipped)",
+            w.data.len(),
+            w.skipped
+        );
+        targets.extend(std::iter::repeat_n(idx, w.data.len()));
+        data.extend(w.data);
+    }
+    if let Some(e) = bad_spec {
+        return Err(e);
     }
     let model =
         Model::fit(&data, &targets, labels, subcarriers, win, cfg).map_err(|e| e.to_string())?;
