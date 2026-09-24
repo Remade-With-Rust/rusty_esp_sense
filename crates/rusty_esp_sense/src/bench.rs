@@ -373,8 +373,11 @@ fn fit_on(
 ) -> crate::Result<Model> {
     let (data, targets) = {
         let _g = prof::scope(Stage::Gather);
-        let mut data = Vec::new();
-        let mut targets = Vec::new();
+        // Sized once from the captures' window counts: grown by doubling,
+        // the two lists reallocated and copied about a dozen times per fit.
+        let n: usize = prepared.iter().map(|p| p.windows.len()).sum();
+        let mut data = Vec::with_capacity(n);
+        let mut targets = Vec::with_capacity(n);
         for p in prepared {
             // Borrowed, not cloned: the fit copies each row once, into the
             // tensor it stacks.
