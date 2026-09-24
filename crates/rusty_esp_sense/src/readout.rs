@@ -176,6 +176,12 @@ impl Ridge {
 /// Solve `A X = B` for symmetric positive definite `A` (`d × d`, row-major,
 /// overwritten with its Cholesky factor) and `B` (`d × k`). `None` when `A`
 /// is not positive definite.
+///
+/// The kernels below are written for the vector unit and the cache, and
+/// every one of them is bit-identical to the plain loops kept as
+/// `tests::reference_solve` -- each sum runs in its original order; what
+/// is vectorised is independent accumulators side by side, never one sum
+/// reassociated.
 fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f64>> {
     let _g = prof::scope(Stage::Cholesky);
     // Inner-loop multiply-adds, exactly: the factor's plus two triangular
@@ -185,14 +191,28 @@ fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f6
         Counter::CholeskyMacs,
         factor + (k as u64) * (d as u64) * (d as u64).saturating_sub(1),
     );
-    // A = L Lᵀ, L in the lower triangle.
+    if !cholesky_factor(a, d) {
+        return None;
+    }
+    let mut x = b.to_vec();
+    for c in 0..k {
+        solve_forward(a, d, &mut x, k, c);
+        solve_back(a, d, &mut x, k, c);
+    }
+    Some(x)
+}
+
+/// `A = L Lᵀ`, `L` in the lower triangle of `a`; `false` when `A` is not
+/// positive definite.
+#[inline(never)]
+fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
     for j in 0..d {
         let mut s = a[j * d + j];
         for p in 0..j {
             s -= a[j * d + p] * a[j * d + p];
         }
         if s <= 0.0 || !s.is_finite() {
-            return None;
+            return false;
         }
         let ljj = s.sqrt();
         a[j * d + j] = ljj;
@@ -204,31 +224,125 @@ fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f6
             a[i * d + j] = s / ljj;
         }
     }
-    let mut x = b.to_vec();
-    for c in 0..k {
-        // L y = b
-        for i in 0..d {
-            let mut s = x[i * k + c];
-            for p in 0..i {
-                s -= a[i * d + p] * x[p * k + c];
-            }
-            x[i * k + c] = s / a[i * d + i];
+    true
+}
+
+/// `L y = b` for column `c` of `x` (`d × k`), in place.
+#[inline(never)]
+fn solve_forward(a: &[f64], d: usize, x: &mut [f64], k: usize, c: usize) {
+    for i in 0..d {
+        let mut s = x[i * k + c];
+        for p in 0..i {
+            s -= a[i * d + p] * x[p * k + c];
         }
-        // Lᵀ x = y
-        for i in (0..d).rev() {
-            let mut s = x[i * k + c];
-            for p in i + 1..d {
-                s -= a[p * d + i] * x[p * k + c];
-            }
-            x[i * k + c] = s / a[i * d + i];
-        }
+        x[i * k + c] = s / a[i * d + i];
     }
-    Some(x)
+}
+
+/// `Lᵀ x = y` for column `c` of `x` (`d × k`), in place.
+#[inline(never)]
+fn solve_back(a: &[f64], d: usize, x: &mut [f64], k: usize, c: usize) {
+    for i in (0..d).rev() {
+        let mut s = x[i * k + c];
+        for p in i + 1..d {
+            s -= a[p * d + i] * x[p * k + c];
+        }
+        x[i * k + c] = s / a[i * d + i];
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plain loops the kernels are held to, bit for bit: the solve as it
+    /// was written before any optimisation, kept as the oracle.
+    /// Solve `A X = B` for symmetric positive definite `A` (`d × d`, row-major,
+    /// overwritten with its Cholesky factor) and `B` (`d × k`). `None` when `A`
+    /// is not positive definite.
+    fn reference_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f64>> {
+        // Inner-loop multiply-adds, exactly: the factor's plus two triangular
+        // solves per right-hand side.
+        let factor: u64 = (0..d as u64).map(|j| j + (d as u64 - j - 1) * j).sum();
+        prof::add(
+            Counter::CholeskyMacs,
+            factor + (k as u64) * (d as u64) * (d as u64).saturating_sub(1),
+        );
+        // A = L Lᵀ, L in the lower triangle.
+        for j in 0..d {
+            let mut s = a[j * d + j];
+            for p in 0..j {
+                s -= a[j * d + p] * a[j * d + p];
+            }
+            if s <= 0.0 || !s.is_finite() {
+                return None;
+            }
+            let ljj = s.sqrt();
+            a[j * d + j] = ljj;
+            for i in j + 1..d {
+                let mut s = a[i * d + j];
+                for p in 0..j {
+                    s -= a[i * d + p] * a[j * d + p];
+                }
+                a[i * d + j] = s / ljj;
+            }
+        }
+        let mut x = b.to_vec();
+        for c in 0..k {
+            // L y = b
+            for i in 0..d {
+                let mut s = x[i * k + c];
+                for p in 0..i {
+                    s -= a[i * d + p] * x[p * k + c];
+                }
+                x[i * k + c] = s / a[i * d + i];
+            }
+            // Lᵀ x = y
+            for i in (0..d).rev() {
+                let mut s = x[i * k + c];
+                for p in i + 1..d {
+                    s -= a[p * d + i] * x[p * k + c];
+                }
+                x[i * k + c] = s / a[i * d + i];
+            }
+        }
+        Some(x)
+    }
+
+    /// Every kernel against the oracle, bit for bit, over sizes that hit
+    /// every remainder of every unrolled or blocked loop, and 1-3 columns.
+    #[test]
+    fn the_kernels_match_the_reference_bit_for_bit() {
+        for d in (1usize..=40).chain([63, 64, 65, 127, 128, 129, 200]) {
+            let mut a0 = vec![0.0f64; d * d];
+            for i in 0..d {
+                for j in 0..=i {
+                    let v = (((i * 7919 + j * 104_729) % 997) as f64 / 997.0 - 0.5) * 0.9;
+                    a0[i * d + j] = v;
+                    a0[j * d + i] = v;
+                }
+                a0[i * d + i] += d as f64 * 0.6 + 1.0;
+            }
+            for k in 1..=3 {
+                let b: Vec<f64> = (0..d * k)
+                    .map(|i| ((i * 31) % 17) as f64 - 8.0 + i as f64 / 7.0)
+                    .collect();
+                let want = reference_solve(&mut a0.clone(), d, &b, k).expect("SPD");
+                let got = cholesky_solve(&mut a0.clone(), d, &b, k).expect("SPD");
+                let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got), bits(&want), "d {d} k {k}");
+                let mut fa = a0.clone();
+                let mut ra = a0.clone();
+                assert!(cholesky_factor(&mut fa, d));
+                let _ = reference_solve(&mut ra, d, &b, k);
+                assert_eq!(bits(&fa), bits(&ra), "factor, d {d}");
+            }
+        }
+        // Not positive definite: refused by both.
+        let mut bad = vec![1.0, 2.0, 2.0, 1.0];
+        assert!(cholesky_solve(&mut bad.clone(), 2, &[1.0, 1.0], 1).is_none());
+        assert!(reference_solve(&mut bad, 2, &[1.0, 1.0], 1).is_none());
+    }
 
     /// The cache sweep (codec-analyzer #3): nanoseconds per multiply-add of
     /// the solve as the factor outgrows L1, L2 and L3. Flat means compute;
