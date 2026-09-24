@@ -354,6 +354,9 @@ fn called_occupied(model: &Model, captures: &[&Prepared]) -> crate::Result<Vec<V
     Ok(out)
 }
 
+/// Per capture scored, its scenario and its window-by-window calls.
+type Calls = Vec<(Scenario, Vec<bool>)>;
+
 fn fit_on(
     prepared: &[&Prepared],
     subcarriers: usize,
@@ -472,34 +475,54 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
         None
     };
 
-    // Held out, fold by fold.
-    let mut held = Vec::new();
+    // Held out, fold by fold, and the confound (fit on E1 + E2 only, scored
+    // on E3 + E4). Every one of these fits is independent -- its own
+    // training rows, its own model, the one shared encoder only read -- so
+    // they run on rayon's pool together (the multiplies inside them share
+    // the same pool). Results are kept per job and concatenated in job
+    // order, the confound last, so the tables are built exactly as the
+    // sequential loop built them and the first failure in that order is
+    // the one returned.
+    let mut jobs: Vec<(bool, Vec<&Prepared>, Vec<&Prepared>)> = Vec::new();
     for f in 0..folds {
         let train: Vec<&Prepared> = prepared.iter().filter(|p| p.fold != f).collect();
         let test: Vec<&Prepared> = prepared.iter().filter(|p| p.fold == f).collect();
-        if test.is_empty() {
-            continue;
-        }
-        let model = fit_on(&train, subcarriers, cfg, encoder.as_ref())?;
-        for (p, calls) in test.iter().zip(called_occupied(&model, &test)?) {
-            held.push((p.scenario, calls));
+        if !test.is_empty() {
+            jobs.push((false, train, test));
         }
     }
-
-    // The confound: E1 + E2 only.
     let e12: Vec<&Prepared> = prepared
         .iter()
         .filter(|p| matches!(p.scenario, Scenario::Baseline | Scenario::Walking))
         .collect();
-    let mut confound = Vec::new();
     if !e12.is_empty() {
-        let model = fit_on(&e12, subcarriers, cfg, encoder.as_ref())?;
         let later: Vec<&Prepared> = prepared
             .iter()
             .filter(|p| matches!(p.scenario, Scenario::Traffic | Scenario::Coexistence))
             .collect();
-        for (p, calls) in later.iter().zip(called_occupied(&model, &later)?) {
-            confound.push((p.scenario, calls));
+        jobs.push((true, e12, later));
+    }
+    let scored: Vec<crate::Result<(bool, Calls)>> = jobs
+        .par_iter()
+        .map(|(confound, train, test)| {
+            let model = fit_on(train, subcarriers, cfg, encoder.as_ref())?;
+            let calls = called_occupied(&model, test)?;
+            let rows = test
+                .iter()
+                .zip(calls)
+                .map(|(p, c)| (p.scenario, c))
+                .collect();
+            Ok((*confound, rows))
+        })
+        .collect();
+    let mut held = Vec::new();
+    let mut confound = Vec::new();
+    for r in scored {
+        let (is_confound, rows) = r?;
+        if is_confound {
+            confound.extend(rows);
+        } else {
+            held.extend(rows);
         }
     }
 
