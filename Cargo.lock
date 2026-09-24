@@ -3462,6 +3462,7 @@ name = "rusty_esp_sense"
 version = "0.1.0"
 dependencies = [
  "candle-core",
+ "memchr",
  "rusty_esp_iroh-host",
  "rusty_esp_signal-core",
  "serde_json",

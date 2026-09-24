@@ -64,7 +64,12 @@ pub fn parse_bytes(name: &str, bytes: &[u8], layout: u8, frame_us: u64) -> crate
     let _g = prof::scope(Stage::Parse);
     let mut samples = Vec::with_capacity(bytes.len() / 400);
     let mut rejected = 0usize;
-    for raw in bytes.split(|&b| b == b'\n') {
+    // Lines are found with `memchr`'s vectorised search; the segments are
+    // exactly `bytes.split(|&b| b == b'\n')`'s, the last one included.
+    let mut start = 0usize;
+    for end in memchr::memchr_iter(b'\n', bytes).chain(core::iter::once(bytes.len())) {
+        let raw = &bytes[start..end];
+        start = end + 1;
         let parsed = if raw.is_ascii() {
             let line = trim_ascii(raw);
             if line.is_empty() {
@@ -324,6 +329,33 @@ mod tests {
             }
         }
         assert_eq!(checked, 2400);
+    }
+
+    /// V10's oracle: the `memchr` line walk yields exactly `split`'s
+    /// segments, for empty input, leading, trailing and doubled newlines.
+    #[test]
+    fn the_line_walk_is_split_on_newline() {
+        for text in [
+            "",
+            "\n",
+            "a",
+            "a\n",
+            "\na",
+            "a\n\nb",
+            "a\nb\n\n",
+            "\n\n\n",
+            "ab\ncd\nef",
+        ] {
+            let bytes = text.as_bytes();
+            let mut got = Vec::new();
+            let mut start = 0usize;
+            for end in memchr::memchr_iter(b'\n', bytes).chain(core::iter::once(bytes.len())) {
+                got.push(&bytes[start..end]);
+                start = end + 1;
+            }
+            let want: Vec<&[u8]> = bytes.split(|&b| b == b'\n').collect();
+            assert_eq!(got, want, "{text:?}");
+        }
     }
 
     /// The whole-capture path: bytes and text parse to the same samples;
