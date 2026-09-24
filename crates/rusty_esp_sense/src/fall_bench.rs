@@ -138,10 +138,15 @@ pub fn run(recordings: &[Recording], burst: Option<u16>) -> FallReport {
         .iter()
         .filter_map(|(_, st)| Some(st.last()?.0.0.saturating_sub(st.first()?.0.0)))
         .sum();
-    // The margin: walk the threshold down until the test half alarms.
-    let mut first_false_at = 0u16;
-    let mut b = config.burst_permille;
-    while b > config.active_permille {
+    // The margin: walk the threshold down until the test half alarms. The
+    // first threshold walked is the default, just evaluated above.
+    let mut first_false_at = if false_events > 0 {
+        config.burst_permille
+    } else {
+        0
+    };
+    let mut b = config.burst_permille.saturating_sub(1);
+    while first_false_at == 0 && b > config.active_permille {
         let c = FallConfig {
             burst_permille: b,
             ..config
