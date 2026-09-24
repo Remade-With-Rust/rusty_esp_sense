@@ -197,9 +197,7 @@ fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f6
     let mut x = b.to_vec();
     if k == 2 {
         solve_forward_pair(a, d, &mut x);
-        for c in 0..k {
-            solve_back(a, d, &mut x, k, c);
-        }
+        solve_back_pair(a, d, &mut x);
     } else {
         for c in 0..k {
             solve_forward(a, d, &mut x, k, c);
@@ -297,6 +295,29 @@ fn solve_forward_pair(a: &[f64], d: usize, x: &mut [f64]) {
         let s = {
             let mut s = [x[2 * i], x[2 * i + 1]];
             for (&l, pair) in a[i * d..i * d + i].iter().zip(x.chunks_exact(2)) {
+                s[0] -= l * pair[0];
+                s[1] -= l * pair[1];
+            }
+            s
+        };
+        let dii = a[i * d + i];
+        x[2 * i] = s[0] / dii;
+        x[2 * i + 1] = s[1] / dii;
+    }
+}
+
+/// `Lᵀ x = y` for both columns of a two-column `x` at once, as
+/// [`solve_forward_pair`] does forward: bit for bit two calls of
+/// [`solve_back`].
+#[inline(never)]
+fn solve_back_pair(a: &[f64], d: usize, x: &mut [f64]) {
+    for i in (0..d).rev() {
+        let s = {
+            let mut s = [x[2 * i], x[2 * i + 1]];
+            // Below row i of column i; for the last row there is nothing
+            // below, and the start index is past the matrix.
+            let column = a.get((i + 1) * d + i..).unwrap_or(&[]).iter().step_by(d);
+            for (&l, pair) in column.zip(x[2 * (i + 1)..].chunks_exact(2)) {
                 s[0] -= l * pair[0];
                 s[1] -= l * pair[1];
             }
