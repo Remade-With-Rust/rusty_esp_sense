@@ -611,15 +611,16 @@ fn bench_night(args: &mut Args) -> Result<(), String> {
                     .map_or(offset, |x| offset + (x.at.0 - base));
                 offset = end + bench::FRAME_US;
             }
+            // Each sample read at its new time, by reference: copying the
+            // whole record to change its timestamp moved 42 MB.
             let retimed = caps.iter().zip(offsets).flat_map(|(r, off)| {
                 let base = r.capture.samples.first().map_or(0, |x| x.at.0);
-                r.capture.samples.iter().map(move |x| {
-                    let mut y = *x;
-                    y.at = Micros(off + (x.at.0 - base));
-                    y
-                })
+                r.capture
+                    .samples
+                    .iter()
+                    .map(move |x| (Micros(off + (x.at.0 - base)), x))
             });
-            let epochs = sleep::epochs_iter(retimed, &cfg);
+            let epochs = sleep::epochs_at(retimed, &cfg);
             let states = sleep::score(&epochs, &cfg);
             (s, epochs, states)
         })

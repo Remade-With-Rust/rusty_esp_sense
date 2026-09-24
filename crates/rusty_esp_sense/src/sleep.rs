@@ -112,13 +112,26 @@ impl State {
 /// Measure a recording's epochs.
 #[must_use]
 pub fn epochs(samples: &[Sample], cfg: &NightConfig) -> Vec<Epoch> {
-    epochs_iter(samples.iter().copied(), cfg)
+    epochs_at(samples.iter().map(|s| (s.at, s)), cfg)
 }
 
 /// [`epochs`] over samples as they come: a caller that re-times or splices
 /// recordings passes them through without storing the result first.
 #[must_use]
 pub fn epochs_iter<I: IntoIterator<Item = Sample>>(samples: I, cfg: &NightConfig) -> Vec<Epoch> {
+    epochs_at(samples.into_iter().map(|s| (s.at, s)), cfg)
+}
+
+/// [`epochs`] over `(time, sample)` pairs: each sample read at the time
+/// given beside it, owned or borrowed. A caller that re-times recordings
+/// (the night benchmark plays captures end to end) passes the new time and
+/// a reference, instead of copying every sample to change its timestamp.
+#[must_use]
+pub fn epochs_at<S, I>(samples: I, cfg: &NightConfig) -> Vec<Epoch>
+where
+    S: core::borrow::Borrow<Sample>,
+    I: IntoIterator<Item = (Micros, S)>,
+{
     let _g = prof::scope(Stage::Night);
     let mut samples = samples.into_iter().peekable();
     let mut pushed = 0u64;
@@ -126,15 +139,16 @@ pub fn epochs_iter<I: IntoIterator<Item = Sample>>(samples: I, cfg: &NightConfig
     let mut vit: Box<VitalsEstimator<200>> =
         Box::new(VitalsEstimator::new(VitalsConfig::breathing(cfg.frame_hz)));
     let mut out = Vec::new();
-    let Some(first) = samples.peek() else {
+    let Some(&(first, _)) = samples.peek() else {
         return out;
     };
-    let mut start = first.at;
+    let mut start = first;
     let (mut frames, mut moving) = (0usize, 0usize);
     let mut breath: Option<(u16, u16)> = None;
-    for s in samples {
+    for (at, s) in samples {
+        let s: &Sample = s.borrow();
         pushed += 1;
-        while s.at.0 >= start.0 + cfg.epoch.0 {
+        while at.0 >= start.0 + cfg.epoch.0 {
             close(start, frames, moving, breath, &mut out);
             start = Micros(start.0 + cfg.epoch.0);
             frames = 0;
@@ -143,8 +157,8 @@ pub fn epochs_iter<I: IntoIterator<Item = Sample>>(samples: I, cfg: &NightConfig
         }
         let Ok(f) = s.features() else { continue };
         let norm = f.normalised();
-        det.push(&norm, s.at);
-        if let Some(v) = vit.push(&norm, s.at) {
+        det.push(&norm, at);
+        if let Some(v) = vit.push(&norm, at) {
             if v.accepted {
                 breath = Some((v.bpm_x10, v.confidence));
             }
@@ -160,9 +174,6 @@ pub fn epochs_iter<I: IntoIterator<Item = Sample>>(samples: I, cfg: &NightConfig
     prof::add(Counter::DetectorPushes, pushed);
     prof::add(Counter::VitalsPushes, pushed);
     prof::add(Counter::FeatureComputations, pushed);
-    // Every sample arrives here by value: a copy of the whole record (the
-    // callers copy or re-time each one to pass it).
-    prof::add(Counter::SampleCopies, pushed);
     out
 }
 
