@@ -41,7 +41,7 @@ use crate::encoder::RandomFeatures;
 use crate::model::{FitConfig, Model};
 use crate::prof::{self, Counter, Stage};
 use crate::readout::{Ridge, Standardize};
-use crate::window::{WindowBuilder, WindowConfig, Windows};
+use crate::window::{WindowBuilder, WindowConfig};
 use rayon::prelude::*;
 
 /// The dataset's frame interval: 50 Hz.
@@ -280,31 +280,57 @@ pub struct Report {
 struct Prepared {
     scenario: Scenario,
     fold: usize,
-    windows: Vec<Vec<f32>>,
+    /// Every window of the capture in one buffer, `width` values each: a
+    /// heap vector per window before.
+    windows: Vec<f32>,
+    width: usize,
+    count: usize,
     detector: Vec<bool>,
+}
+
+impl Prepared {
+    fn rows(&self) -> core::slice::ChunksExact<'_, f32> {
+        self.windows.chunks_exact(self.width.max(1))
+    }
+}
+
+/// A capture's windows in one buffer.
+struct Flat {
+    subcarriers: usize,
+    data: Vec<f32>,
+    count: usize,
 }
 
 /// A capture's windows and, over the same frames, the on-chip detector's
 /// call at the end of each window -- in ONE pass. Each frame's features are
 /// computed and normalised once and handed to both; they were computed
 /// twice before (docs/PERF.md).
-fn prepare(c: &Capture, cfg: WindowConfig) -> (Windows, Vec<bool>) {
+fn prepare(c: &Capture, cfg: WindowConfig) -> (Flat, Vec<bool>) {
     let _g = prof::scope(Stage::Window);
     prof::add(Counter::DetectorPushes, c.samples.len() as u64);
     prof::add(Counter::FeatureComputations, c.samples.len() as u64);
     let frames = cfg.frames.max(1);
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
     let mut b = WindowBuilder::new(cfg);
-    // At most one window and one call per `frames` samples: sized once, not
-    // grown by doubling (a fresh allocation and a copy each time).
-    let most = c.samples.len() / frames + 1;
-    let mut data = Vec::with_capacity(most);
+    // A window takes exactly `frames` frames and a call is made every
+    // `frames` frames, so there are at most samples / frames of each: sized
+    // once, not grown by doubling (a fresh allocation and a copy each time).
+    let most = c.samples.len() / frames;
+    let mut data: Vec<f32> = Vec::new();
+    let mut count = 0usize;
     let mut calls = Vec::with_capacity(most);
     let mut seen = 0usize;
     for s in &c.samples {
         let norm = s.features().ok().map(|f| f.normalised());
-        if let Some(w) = b.push(norm.as_ref()) {
-            data.push(w);
+        if data.capacity() == 0 {
+            if let Some(f) = &norm {
+                // The width is known from the first frame: every window of
+                // the capture fits in one buffer, sized once.
+                data.reserve_exact(most * cfg.width(f.amplitudes().len()));
+            }
+        }
+        if b.push_into(norm.as_ref(), &mut data) {
+            count += 1;
         }
         if let Some(f) = &norm {
             let verdict = det.push(f, Micros(s.at.0));
@@ -314,11 +340,11 @@ fn prepare(c: &Capture, cfg: WindowConfig) -> (Windows, Vec<bool>) {
             }
         }
     }
-    calls.truncate(data.len());
-    let w = Windows {
+    calls.truncate(count);
+    let w = Flat {
         subcarriers: b.subcarriers(),
         data,
-        skipped: b.skipped(),
+        count,
     };
     (w, calls)
 }
@@ -349,15 +375,15 @@ fn called_occupied(model: &Model, captures: &[&Prepared]) -> crate::Result<Vec<V
         .ok_or_else(|| crate::Error::Model("no `occupied` label".into()))?;
     // Sized once: a flattening iterator's size hint starts at zero, so
     // collecting it grew the list by doubling.
-    let mut rows: Vec<&[f32]> = Vec::with_capacity(captures.iter().map(|p| p.windows.len()).sum());
+    let mut rows: Vec<&[f32]> = Vec::with_capacity(captures.iter().map(|p| p.count).sum());
     for p in captures {
-        rows.extend(p.windows.iter().map(Vec::as_slice));
+        rows.extend(p.rows());
     }
     let calls = model.classify(&rows)?;
     let mut out = Vec::with_capacity(captures.len());
     let mut at = 0;
     for p in captures {
-        let n = p.windows.len();
+        let n = p.count;
         out.push(calls[at..at + n].iter().map(|&c| c == occupied).collect());
         at += n;
     }
@@ -377,14 +403,14 @@ fn fit_on(
         let _g = prof::scope(Stage::Gather);
         // Sized once from the captures' window counts: grown by doubling,
         // the two lists reallocated and copied about a dozen times per fit.
-        let n: usize = prepared.iter().map(|p| p.windows.len()).sum();
+        let n: usize = prepared.iter().map(|p| p.count).sum();
         let mut data = Vec::with_capacity(n);
         let mut targets = Vec::with_capacity(n);
         for p in prepared {
             // Borrowed, not cloned: the fit copies each row once, into the
             // tensor it stacks.
-            for w in &p.windows {
-                data.push(w.as_slice());
+            for w in p.rows() {
+                data.push(w);
                 targets.push(usize::from(p.scenario.occupied()));
             }
         }
@@ -447,7 +473,7 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
     // Each recording's windows and detector calls depend on that recording
     // alone: prepared in parallel, collected in order. The checks and the
     // fold numbering below still run over them in recording order.
-    let windowed: Vec<(Windows, Vec<bool>)> = recordings
+    let windowed: Vec<(Flat, Vec<bool>)> = recordings
         .par_iter()
         .map(|r| prepare(&r.capture, cfg.window))
         .collect();
@@ -467,11 +493,13 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
             .unwrap_or(0);
         let fold = per_scenario[idx] % folds;
         per_scenario[idx] += 1;
-        counts.push(w.data.len());
+        counts.push(w.count);
         prepared.push(Prepared {
             scenario: r.scenario,
             fold,
             windows: w.data,
+            width: cfg.window.width(subcarriers),
+            count: w.count,
             detector,
         });
     }

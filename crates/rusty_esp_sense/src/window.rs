@@ -129,9 +129,18 @@ impl WindowBuilder {
     /// One frame: its NORMALISED features, or `None` when they could not be
     /// computed. The window, when this frame completes one.
     pub fn push(&mut self, norm: Option<&Features>) -> Option<Vec<f32>> {
+        let mut w = Vec::new();
+        self.push_into(norm, &mut w).then_some(w)
+    }
+
+    /// [`WindowBuilder::push`], appending a completed window to `out`
+    /// instead of returning it in a vector of its own: a caller keeping
+    /// many windows keeps them in one buffer, `width` values each.
+    /// `true` when this frame completed a window.
+    pub fn push_into(&mut self, norm: Option<&Features>, out: &mut Vec<f32>) -> bool {
         let Some(norm) = norm else {
             self.skipped += 1;
-            return None;
+            return false;
         };
         let amps = norm.amplitudes();
         if self.subcarriers == 0 {
@@ -139,7 +148,7 @@ impl WindowBuilder {
         }
         if amps.len() != self.subcarriers || amps.is_empty() {
             self.skipped += 1;
-            return None;
+            return false;
         }
         // `normalised` scales so the frame's mean is 1024.
         let t = self.cfg.frames.max(1);
@@ -151,17 +160,17 @@ impl WindowBuilder {
         self.filled += 1;
         prof::add(Counter::FramesWindowed, 1);
         if self.filled < t {
-            return None;
+            return false;
         }
         prof::add(Counter::Windows, 1);
-        let w = if self.cfg.wander {
-            wander(&self.frames, t, self.subcarriers, &mut self.mean)
+        if self.cfg.wander {
+            wander_into(&self.frames, t, self.subcarriers, &mut self.mean, out);
         } else {
-            flatten(&self.frames, t, self.subcarriers, self.cfg.centre)
-        };
+            flatten_into(&self.frames, t, self.subcarriers, self.cfg.centre, out);
+        }
         self.frames.clear();
         self.filled = 0;
-        Some(w)
+        true
     }
 }
 
@@ -195,7 +204,15 @@ pub fn windows(samples: &[Sample], cfg: WindowConfig) -> Windows {
 /// floats at, so the result is bit for bit the per-subcarrier loops it
 /// replaced -- which walked down the buffer with a stride of `s`.
 #[inline(never)]
+#[cfg(test)]
 fn wander(frames: &[f32], t: usize, s: usize, mean: &mut Vec<f32>) -> Vec<f32> {
+    let mut out = Vec::new();
+    wander_into(frames, t, s, mean, &mut out);
+    out
+}
+
+/// Each subcarrier's spread over the window, appended to `out`.
+fn wander_into(frames: &[f32], t: usize, s: usize, mean: &mut Vec<f32>, out: &mut Vec<f32>) {
     let tf = t as f32;
     // The caller's scratch, reset to the same starting values each window.
     mean.clear();
@@ -206,14 +223,17 @@ fn wander(frames: &[f32], t: usize, s: usize, mean: &mut Vec<f32>) -> Vec<f32> {
     for m in mean.iter_mut() {
         *m /= tf;
     }
-    let mut var = vec![-0.0f32; s];
+    // The spreads accumulate in place at the end of `out`, from the same
+    // starting values (-0.0) the separate vector had.
+    let at = out.len();
+    out.resize(at + s, -0.0);
+    let var = &mut out[at..];
     for row in frames.chunks_exact(s).take(t) {
-        add_squared_deviations(&mut var, row, mean);
+        add_squared_deviations(var, row, mean);
     }
-    for v in &mut var {
+    for v in var.iter_mut() {
         *v = (*v / tf).sqrt();
     }
-    var
 }
 
 /// `acc[k] += row[k]`. Each lane is its own accumulator: nothing is
@@ -238,12 +258,20 @@ fn add_squared_deviations(acc: &mut [f32], row: &[f32], mean: &[f32]) {
 }
 
 /// The window subcarrier-major, from `frames` (frame-major).
-#[inline(never)]
+#[cfg(test)]
 fn flatten(frames: &[f32], t: usize, s: usize, centre: bool) -> Vec<f32> {
+    let mut w = Vec::with_capacity(s * t);
+    flatten_into(frames, t, s, centre, &mut w);
+    w
+}
+
+/// The window subcarrier-major, appended to `w`.
+#[inline(never)]
+fn flatten_into(frames: &[f32], t: usize, s: usize, centre: bool, w: &mut Vec<f32>) {
     debug_assert_eq!(frames.len(), t * s);
     // Appended row by row, each value written once: zero-filling the
     // window first wrote all of it twice.
-    let mut w = Vec::with_capacity(s * t);
+    w.reserve(s * t);
     for k in 0..s {
         // Subcarrier k of every frame. Each frame is an exact chunk of `s`
         // and `k < s`, so the column read carries no check.
@@ -257,7 +285,6 @@ fn flatten(frames: &[f32], t: usize, s: usize, centre: bool) -> Vec<f32> {
             }
         }
     }
-    w
 }
 
 #[cfg(test)]
