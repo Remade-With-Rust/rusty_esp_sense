@@ -89,7 +89,11 @@ pub struct Windows {
 pub struct WindowBuilder {
     cfg: WindowConfig,
     subcarriers: usize,
-    frames: Vec<Vec<f32>>,
+    /// The window being filled, frame-major (`frames × subcarriers`), one
+    /// buffer reused for every window: it was a heap vector per frame.
+    frames: Vec<f32>,
+    /// Frames in `frames`.
+    filled: usize,
     skipped: usize,
 }
 
@@ -100,7 +104,8 @@ impl WindowBuilder {
         WindowBuilder {
             cfg,
             subcarriers: 0,
-            frames: Vec::with_capacity(cfg.frames.max(1)),
+            frames: Vec::new(),
+            filled: 0,
             skipped: 0,
         }
     }
@@ -133,20 +138,25 @@ impl WindowBuilder {
             return None;
         }
         // `normalised` scales so the frame's mean is 1024.
+        let t = self.cfg.frames.max(1);
+        if self.frames.capacity() == 0 {
+            self.frames.reserve_exact(t * self.subcarriers);
+        }
         self.frames
-            .push(amps.iter().map(|&a| f32::from(a) / 1024.0).collect());
-        prof::add(Counter::FrameVecs, 1);
+            .extend(amps.iter().map(|&a| f32::from(a) / 1024.0));
+        self.filled += 1;
         prof::add(Counter::FramesWindowed, 1);
-        if self.frames.len() < self.cfg.frames.max(1) {
+        if self.filled < t {
             return None;
         }
         prof::add(Counter::Windows, 1);
         let w = if self.cfg.wander {
-            wander(&self.frames, self.subcarriers)
+            wander(&self.frames, t, self.subcarriers)
         } else {
-            flatten(&self.frames, self.subcarriers, self.cfg.centre)
+            flatten(&self.frames, t, self.subcarriers, self.cfg.centre)
         };
         self.frames.clear();
+        self.filled = 0;
         Some(w)
     }
 }
@@ -172,23 +182,26 @@ pub fn windows(samples: &[Sample], cfg: WindowConfig) -> Windows {
     }
 }
 
-fn wander(frames: &[Vec<f32>], s: usize) -> Vec<f32> {
-    let t = frames.len() as f32;
+/// Each subcarrier's standard deviation over the `t` frames of `frames`
+/// (frame-major). The sums run over frames in order, as they always have.
+fn wander(frames: &[f32], t: usize, s: usize) -> Vec<f32> {
+    let tf = t as f32;
     (0..s)
         .map(|k| {
-            let mean = frames.iter().map(|f| f[k]).sum::<f32>() / t;
-            (frames.iter().map(|f| (f[k] - mean).powi(2)).sum::<f32>() / t).sqrt()
+            let at = |j: usize| frames[j * s + k];
+            let mean = (0..t).map(at).sum::<f32>() / tf;
+            ((0..t).map(|j| (at(j) - mean).powi(2)).sum::<f32>() / tf).sqrt()
         })
         .collect()
 }
 
-fn flatten(frames: &[Vec<f32>], s: usize, centre: bool) -> Vec<f32> {
-    let t = frames.len();
+/// The window subcarrier-major, from `frames` (frame-major).
+fn flatten(frames: &[f32], t: usize, s: usize, centre: bool) -> Vec<f32> {
     let mut w = vec![0f32; s * t];
     for k in 0..s {
         let row = &mut w[k * t..(k + 1) * t];
-        for (j, f) in frames.iter().enumerate() {
-            row[j] = f[k];
+        for (j, v) in row.iter_mut().enumerate() {
+            *v = frames[j * s + k];
         }
         if centre {
             let mean = row.iter().sum::<f32>() / t as f32;
