@@ -45,6 +45,30 @@ pub fn wander_stream(r: &Recording) -> Stream {
     out
 }
 
+/// The highest wander [`wander_stream`] would report, without the stream.
+#[must_use]
+pub fn wander_peak(r: &Recording) -> u16 {
+    let _g = prof::scope(Stage::Detector);
+    prof::add(Counter::DetectorPushes, r.capture.samples.len() as u64);
+    prof::add(Counter::FeatureComputations, r.capture.samples.len() as u64);
+    let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
+    let mut peak = 0u16;
+    let mut any = false;
+    for s in &r.capture.samples {
+        let Ok(f) = s.features() else { continue };
+        det.push(&f.normalised(), s.at);
+        if det.warm() {
+            peak = if any {
+                peak.max(det.wander())
+            } else {
+                det.wander()
+            };
+            any = true;
+        }
+    }
+    peak
+}
+
 /// Events a detector with `config` raises over `stream`.
 #[must_use]
 pub fn events(stream: &Stream, config: FallConfig) -> usize {
@@ -122,15 +146,16 @@ fn scenario_rank(s: Scenario) -> usize {
 #[must_use]
 pub fn run(recordings: &[Recording], burst: Option<u16>) -> FallReport {
     let mut seen = [0usize; 4];
-    let mut tuning: Vec<(Scenario, Stream)> = Vec::new();
+    // The tuning half is only ever asked for its peak, so its streams are
+    // reduced as they are made, not stored.
+    let mut tuning: Vec<(Scenario, u16)> = Vec::new();
     let mut test: Vec<(Scenario, Stream)> = Vec::new();
     for r in recordings {
         let i = scenario_rank(r.scenario);
-        let stream = wander_stream(r);
         if seen[i] % 2 == 1 {
-            tuning.push((r.scenario, stream));
+            tuning.push((r.scenario, wander_peak(r)));
         } else {
-            test.push((r.scenario, stream));
+            test.push((r.scenario, wander_stream(r)));
         }
         seen[i] += 1;
     }
@@ -140,7 +165,7 @@ pub fn run(recordings: &[Recording], burst: Option<u16>) -> FallReport {
             let m = tuning
                 .iter()
                 .filter(|(x, _)| *x == s)
-                .flat_map(|(_, st)| st.iter().map(|(_, w)| *w))
+                .map(|&(_, peak)| peak)
                 .max()
                 .unwrap_or(0);
             (s, m)
@@ -363,6 +388,31 @@ mod tests {
             assert_eq!(raises_any(&st, c), events(&st, c) > 0);
         }
         assert_eq!(events(&stream(&two), c), 2);
+    }
+
+    /// M10's oracle: the streamed peak is the stream's maximum, on the two
+    /// Cuenca fixtures in rusty_esp_signal (skipped when that checkout is not
+    /// beside this one).
+    #[test]
+    fn the_streamed_peak_is_the_streams_maximum() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../rusty_esp_signal/crates/rusty_esp_signal-core/tests/fixtures/csi");
+        for f in ["c6_empty_room_iter1.csv", "c6_walking_person_iter1.csv"] {
+            let Ok(capture) = crate::capture::read(
+                &dir.join(f),
+                rusty_esp_signal_core::radar::csi_stream::TAG_C6_HT20_NATURAL,
+                20_000,
+            ) else {
+                return;
+            };
+            let r = Recording {
+                scenario: Scenario::Baseline,
+                day: String::new(),
+                capture,
+            };
+            let max = wander_stream(&r).iter().map(|&(_, w)| w).max().unwrap_or(0);
+            assert_eq!(wander_peak(&r), max, "{f}");
+        }
     }
 
     #[test]
