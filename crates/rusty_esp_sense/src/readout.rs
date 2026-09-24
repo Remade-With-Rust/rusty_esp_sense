@@ -31,7 +31,41 @@ impl Standardize {
         let _g = prof::scope(Stage::InputStd);
         let (_, d) = x.dims2()?;
         let v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-        Ok(Self::of(&v, d))
+        Ok(Self::of(v.chunks_exact(d.max(1)), d))
+    }
+
+    /// The statistics of `rows` where they lie, each `d` wide: no stacked
+    /// copy is needed to fit.
+    pub fn of_rows<R: AsRef<[f32]>>(rows: &[R], d: usize) -> Self {
+        let _g = prof::scope(Stage::InputStd);
+        Self::of(rows.iter().map(AsRef::as_ref), d)
+    }
+
+    /// `rows` stacked into one `[n, d]` tensor and standardised: each row
+    /// copied in and standardised while it is in cache -- the same two f32
+    /// operations per element as [`Standardize::apply`] on a stacked copy,
+    /// without the stacked copy.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::Error::Input`] when a row is not this width.
+    pub fn stack_apply<R: AsRef<[f32]>>(&self, rows: &[R]) -> crate::Result<Tensor> {
+        let _g = prof::scope(Stage::Stack);
+        let d = self.mean.len();
+        prof::add(Counter::StackBytes, (rows.len() * d * 4) as u64);
+        prof::add(Counter::TensorBuilds, 1);
+        if rows.iter().any(|w| w.as_ref().len() != d) {
+            return Err(crate::Error::Input(format!(
+                "a window is not {d} values wide"
+            )));
+        }
+        let mut v: Vec<f32> = Vec::with_capacity(rows.len() * d);
+        for r in rows {
+            let at = v.len();
+            v.extend_from_slice(r.as_ref());
+            self.apply_in_place(&mut v[at..]);
+        }
+        Ok(Tensor::from_vec(v, (rows.len(), d), &Device::Cpu)?)
     }
 
     /// [`Standardize::fit`] and then [`Standardize::apply`] to the same
@@ -45,26 +79,26 @@ impl Standardize {
         let _g = prof::scope(Stage::InputStd);
         let (n, d) = x.dims2()?;
         let mut v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-        let norm = Self::of(&v, d);
+        let norm = Self::of(v.chunks_exact(d.max(1)), d);
         norm.apply_in_place(&mut v);
         Ok((norm, Tensor::from_vec(v, (n, d), &Device::Cpu)?))
     }
 
-    /// The statistics of `v`, `d` columns row-major.
-    fn of(v: &[f32], d: usize) -> Self {
+    /// The statistics of `rows`, each `d` wide, in order.
+    fn of<'a, I: Iterator<Item = &'a [f32]> + Clone>(rows: I, d: usize) -> Self {
         // Column sums in f64, row by row, streamed from the f32 values: no
         // f64 copy of the input, no deviations tensor, no squares tensor.
-        let n = v.len() / d.max(1);
+        let n = rows.clone().count();
         let nf = n as f64;
         let mut mean = vec![0f64; d];
-        for row in v.chunks_exact(d) {
+        for row in rows.clone() {
             widen_add(&mut mean, row);
         }
         for m in &mut mean {
             *m /= nf;
         }
         let mut var = vec![0f64; d];
-        for row in v.chunks_exact(d) {
+        for row in rows {
             widen_add_squared_deviations(&mut var, row, &mean);
         }
         for s in &mut var {

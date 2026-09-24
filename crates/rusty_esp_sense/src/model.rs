@@ -13,7 +13,7 @@ use std::path::Path;
 use candle_core::{DType, Device, Tensor};
 
 use crate::encoder::RandomFeatures;
-use crate::prof::{self, Counter, Stage};
+use crate::prof::{self, Stage};
 use crate::readout::{Ridge, Standardize};
 use crate::window::WindowConfig;
 
@@ -65,25 +65,6 @@ pub struct Model {
     pub ridge: Ridge,
     /// Class names, in output order.
     pub labels: Vec<String>,
-}
-
-fn stack<R: AsRef<[f32]>>(data: &[R], width: usize) -> crate::Result<Tensor> {
-    let _g = prof::scope(Stage::Stack);
-    prof::add(Counter::StackBytes, (data.len() * width * 4) as u64);
-    prof::add(Counter::TensorBuilds, 1);
-    if data.iter().any(|w| w.as_ref().len() != width) {
-        return Err(crate::Error::Input(format!(
-            "a window is not {width} values wide"
-        )));
-    }
-    // Sized once: collecting a flattening iterator (whose size hint starts
-    // at zero) grew the buffer by doubling, a fresh allocation and a copy
-    // each time.
-    let mut flat: Vec<f32> = Vec::with_capacity(data.len() * width);
-    for w in data {
-        flat.extend_from_slice(w.as_ref());
-    }
-    Ok(Tensor::from_vec(flat, (data.len(), width), &Device::Cpu)?)
 }
 
 impl Model {
@@ -145,7 +126,13 @@ impl Model {
         // The stacked and standardised inputs live only until encoded, not
         // through the readout's fit.
         let (input, phi) = {
-            let (input, z) = Standardize::fit_apply(&stack(data, width)?)?;
+            if data.iter().any(|w| w.as_ref().len() != width) {
+                return Err(crate::Error::Input(format!(
+                    "a window is not {width} values wide"
+                )));
+            }
+            let input = Standardize::of_rows(data, width);
+            let z = input.stack_apply(data)?;
             let phi = match &encoder {
                 Some(e) => e.encode(&z)?,
                 None => z,
@@ -165,18 +152,6 @@ impl Model {
             ridge,
             labels,
         })
-    }
-
-    fn encode_with(
-        input: &Standardize,
-        encoder: Option<&RandomFeatures>,
-        x: &Tensor,
-    ) -> crate::Result<Tensor> {
-        let z = input.apply(x)?;
-        match encoder {
-            Some(e) => e.encode(&z),
-            None => Ok(z),
-        }
     }
 
     /// The readout's scores per window, one per label.
@@ -200,8 +175,17 @@ impl Model {
         if data.is_empty() {
             return Ok(Vec::new());
         }
-        let x = stack(data, self.window.width(self.subcarriers))?;
-        let phi = Self::encode_with(&self.input, self.encoder.as_ref(), &x)?;
+        let width = self.window.width(self.subcarriers);
+        if data.iter().any(|w| w.as_ref().len() != width) {
+            return Err(crate::Error::Input(format!(
+                "a window is not {width} values wide"
+            )));
+        }
+        let z = self.input.stack_apply(data)?;
+        let phi = match &self.encoder {
+            Some(e) => e.encode(&z)?,
+            None => z,
+        };
         let y = self.ridge.predict(&phi)?;
         let _g = prof::scope(Stage::Predict);
         Ok(y.flatten_all()?.to_vec1()?)
