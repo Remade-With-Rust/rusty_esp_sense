@@ -90,27 +90,28 @@ impl RandomFeatures {
         // and the same max with zero, per element, where the broadcast add
         // and relu each built another tensor the size of the product.
         let y = x.matmul(&self.w.t()?)?;
-        let (n, width) = y.dims2()?;
+        let (_, width) = y.dims2()?;
         let b: Vec<f32> = self.b.to_vec1()?;
-        // Read the product where the multiply left it and write each value
-        // once, biased and rectified: a copy out and a second pass over the
-        // copy did the same.
-        let v = crate::host::with_f32(&y, |y| {
-            let mut v = Vec::with_capacity(y.len());
-            for row in y.chunks_exact(width.max(1)) {
-                extend_bias_relu(&mut v, row, &b);
+        // Biased and rectified in the product's own buffer: nothing else
+        // holds this product, and writing it into a second buffer of the
+        // same size (19 MB per fold) cost that buffer's allocation and its
+        // first-touch page faults.
+        crate::host::rewrite_f32(&y, |y| {
+            for row in y.chunks_exact_mut(width.max(1)) {
+                bias_relu(row, &b);
             }
-            v
         })?;
-        Ok(Tensor::from_vec(v, (n, width), &Device::Cpu)?)
+        Ok(y)
     }
 }
 
-/// Append `max(row[j] + b[j], 0)` for each `j`. Its own frame so the
-/// slices arrive as non-aliasing parameters and the loop is packed.
+/// `row[j] = max(row[j] + b[j], 0)`. Its own frame so the slices arrive
+/// as non-aliasing parameters and the loop is packed.
 #[inline(never)]
-fn extend_bias_relu(out: &mut Vec<f32>, row: &[f32], b: &[f32]) {
-    out.extend(row.iter().zip(b).map(|(&e, &bias)| (e + bias).max(0.0)));
+fn bias_relu(row: &mut [f32], b: &[f32]) {
+    for (e, &bias) in row.iter_mut().zip(b) {
+        *e = (*e + bias).max(0.0);
+    }
 }
 
 #[cfg(test)]

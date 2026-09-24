@@ -264,6 +264,23 @@ impl Ridge {
     /// A tensor error when `phi`'s width is not the fitted one.
     pub fn predict(&self, phi: &Tensor) -> crate::Result<Tensor> {
         let z = self.norm.apply(&phi.to_dtype(DType::F32)?)?;
+        self.predict_standardised(&z)
+    }
+
+    /// [`Ridge::predict`] for features the caller alone holds: they are
+    /// standardised in their own buffer, not copied into a second one.
+    pub(crate) fn predict_owned(&self, phi: Tensor) -> crate::Result<Tensor> {
+        let z = if phi.dtype() == DType::F32 && phi.is_contiguous() {
+            let _g = prof::scope(Stage::InputStd);
+            crate::host::rewrite_f32(&phi, |v| self.norm.apply_in_place(v))?;
+            phi
+        } else {
+            self.norm.apply(&phi.to_dtype(DType::F32)?)?
+        };
+        self.predict_standardised(&z)
+    }
+
+    fn predict_standardised(&self, z: &Tensor) -> crate::Result<Tensor> {
         let _g = prof::scope(Stage::Predict);
         prof::add(Counter::TensorBuilds, 2);
         prof::add(

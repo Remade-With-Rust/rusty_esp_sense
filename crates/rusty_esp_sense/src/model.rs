@@ -188,7 +188,8 @@ impl Model {
             Some(e) => e.encode(&z)?,
             None => z,
         };
-        let y = self.ridge.predict(&phi)?;
+        // The features were made here and nothing else holds them.
+        let y = self.ridge.predict_owned(phi)?;
         let _g = prof::scope(Stage::Predict);
         Ok(y.flatten_all()?.to_vec1()?)
     }
