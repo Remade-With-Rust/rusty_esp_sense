@@ -41,7 +41,7 @@ use crate::encoder::RandomFeatures;
 use crate::model::{FitConfig, Model};
 use crate::prof::{self, Counter, Stage};
 use crate::readout::{Ridge, Standardize};
-use crate::window::{self, WindowConfig};
+use crate::window::{WindowBuilder, WindowConfig, Windows};
 
 /// The dataset's frame interval: 50 Hz.
 pub const FRAME_US: u64 = 20_000;
@@ -265,22 +265,40 @@ struct Prepared {
     detector: Vec<bool>,
 }
 
-fn detector_calls(c: &Capture, frames: usize) -> Vec<bool> {
-    let _g = prof::scope(Stage::Detector);
+/// A capture's windows and, over the same frames, the on-chip detector's
+/// call at the end of each window -- in ONE pass. Each frame's features are
+/// computed and normalised once and handed to both; they were computed
+/// twice before (docs/PERF.md).
+fn prepare(c: &Capture, cfg: WindowConfig) -> (Windows, Vec<bool>) {
+    let _g = prof::scope(Stage::Window);
     prof::add(Counter::DetectorPushes, c.samples.len() as u64);
     prof::add(Counter::FeatureComputations, c.samples.len() as u64);
+    let frames = cfg.frames.max(1);
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
+    let mut b = WindowBuilder::new(cfg);
+    let mut data = Vec::new();
     let mut calls = Vec::new();
     let mut seen = 0usize;
     for s in &c.samples {
-        let Ok(f) = s.features() else { continue };
-        let verdict = det.push(&f.normalised(), Micros(s.at.0));
-        seen += 1;
-        if seen % frames.max(1) == 0 {
-            calls.push(matches!(verdict, Verdict::Present { .. }));
+        let norm = s.features().ok().map(|f| f.normalised());
+        if let Some(w) = b.push(norm.as_ref()) {
+            data.push(w);
+        }
+        if let Some(f) = &norm {
+            let verdict = det.push(f, Micros(s.at.0));
+            seen += 1;
+            if seen % frames == 0 {
+                calls.push(matches!(verdict, Verdict::Present { .. }));
+            }
         }
     }
-    calls
+    calls.truncate(data.len());
+    let w = Windows {
+        subcarriers: b.subcarriers(),
+        data,
+        skipped: b.skipped(),
+    };
+    (w, calls)
 }
 
 fn table(rows: &[(Scenario, Vec<bool>)]) -> Table {
@@ -384,7 +402,7 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
     let mut per_scenario = [0usize; 4];
     let mut counts = Vec::new();
     for r in recordings {
-        let w = window::windows(&r.capture.samples, cfg.window);
+        let (w, detector) = prepare(&r.capture, cfg.window);
         if subcarriers == 0 {
             subcarriers = w.subcarriers;
         }
@@ -400,8 +418,6 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
             .unwrap_or(0);
         let fold = per_scenario[idx] % folds;
         per_scenario[idx] += 1;
-        let mut detector = detector_calls(&r.capture, cfg.window.frames);
-        detector.truncate(w.data.len());
         counts.push(w.data.len());
         prepared.push(Prepared {
             scenario: r.scenario,

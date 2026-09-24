@@ -21,6 +21,7 @@
 //! a linear readout of centred amplitudes averages that motion away.
 
 use crate::prof::{self, Counter, Stage};
+use rusty_esp_signal_core::radar::csi::Features;
 use rusty_esp_signal_core::radar::csi_stream::Sample;
 
 /// How to cut windows.
@@ -79,44 +80,96 @@ pub struct Windows {
     pub skipped: usize,
 }
 
+/// Windows cut one frame at a time: push each frame's normalised
+/// features, get a window back when one fills. [`windows`] is this over a
+/// run of samples; a caller that also needs the features for something else
+/// (the benchmark's detector, a live stream) computes them once and pushes
+/// them here.
+#[derive(Debug, Clone)]
+pub struct WindowBuilder {
+    cfg: WindowConfig,
+    subcarriers: usize,
+    frames: Vec<Vec<f32>>,
+    skipped: usize,
+}
+
+impl WindowBuilder {
+    /// A builder for `cfg`.
+    #[must_use]
+    pub fn new(cfg: WindowConfig) -> Self {
+        WindowBuilder {
+            cfg,
+            subcarriers: 0,
+            frames: Vec::with_capacity(cfg.frames.max(1)),
+            skipped: 0,
+        }
+    }
+
+    /// Subcarriers per frame, set by the first frame that had any.
+    #[must_use]
+    pub const fn subcarriers(&self) -> usize {
+        self.subcarriers
+    }
+
+    /// Frames skipped so far.
+    #[must_use]
+    pub const fn skipped(&self) -> usize {
+        self.skipped
+    }
+
+    /// One frame: its NORMALISED features, or `None` when they could not be
+    /// computed. The window, when this frame completes one.
+    pub fn push(&mut self, norm: Option<&Features>) -> Option<Vec<f32>> {
+        let Some(norm) = norm else {
+            self.skipped += 1;
+            return None;
+        };
+        let amps = norm.amplitudes();
+        if self.subcarriers == 0 {
+            self.subcarriers = amps.len();
+        }
+        if amps.len() != self.subcarriers || amps.is_empty() {
+            self.skipped += 1;
+            return None;
+        }
+        // `normalised` scales so the frame's mean is 1024.
+        self.frames
+            .push(amps.iter().map(|&a| f32::from(a) / 1024.0).collect());
+        prof::add(Counter::FrameVecs, 1);
+        prof::add(Counter::FramesWindowed, 1);
+        if self.frames.len() < self.cfg.frames.max(1) {
+            return None;
+        }
+        prof::add(Counter::Windows, 1);
+        let w = if self.cfg.wander {
+            wander(&self.frames, self.subcarriers)
+        } else {
+            flatten(&self.frames, self.subcarriers, self.cfg.centre)
+        };
+        self.frames.clear();
+        Some(w)
+    }
+}
+
 /// Cut `samples` into non-overlapping windows; a partial last window is
 /// dropped.
 #[must_use]
 pub fn windows(samples: &[Sample], cfg: WindowConfig) -> Windows {
     let _g = prof::scope(Stage::Window);
-    let t = cfg.frames.max(1);
-    let mut out = Windows::default();
-    let mut frames: Vec<Vec<f32>> = Vec::with_capacity(t);
+    prof::add(Counter::FeatureComputations, samples.len() as u64);
+    let mut b = WindowBuilder::new(cfg);
+    let mut data = Vec::new();
     for s in samples {
-        prof::add(Counter::FeatureComputations, 1);
-        let Ok(f) = s.features() else {
-            out.skipped += 1;
-            continue;
-        };
-        let norm = f.normalised();
-        let amps = norm.amplitudes();
-        if out.subcarriers == 0 {
-            out.subcarriers = amps.len();
-        }
-        if amps.len() != out.subcarriers || amps.is_empty() {
-            out.skipped += 1;
-            continue;
-        }
-        // `normalised` scales so the frame's mean is 1024.
-        frames.push(amps.iter().map(|&a| f32::from(a) / 1024.0).collect());
-        prof::add(Counter::FrameVecs, 1);
-        prof::add(Counter::FramesWindowed, 1);
-        if frames.len() == t {
-            prof::add(Counter::Windows, 1);
-            out.data.push(if cfg.wander {
-                wander(&frames, out.subcarriers)
-            } else {
-                flatten(&frames, out.subcarriers, cfg.centre)
-            });
-            frames.clear();
+        let norm = s.features().ok().map(|f| f.normalised());
+        if let Some(w) = b.push(norm.as_ref()) {
+            data.push(w);
         }
     }
-    out
+    Windows {
+        subcarriers: b.subcarriers,
+        data,
+        skipped: b.skipped,
+    }
 }
 
 fn wander(frames: &[Vec<f32>], s: usize) -> Vec<f32> {
