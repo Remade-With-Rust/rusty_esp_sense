@@ -249,15 +249,80 @@ fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f6
     Some(x)
 }
 
+/// Columns per panel of the blocked factor, and the side of its tile.
+const PANEL: usize = 16;
+
 /// `A = L Lᵀ`, `L` in the lower triangle of `a`; `false` when `A` is not
 /// positive definite.
+///
+/// Blocked by panels of [`PANEL`] columns, for the cache: before a panel is
+/// finished, the products over every earlier column are subtracted from it
+/// one [`PANEL`]-wide block of columns at a time, ascending, the running
+/// value stored back between blocks. Each entry therefore sees exactly the
+/// subtractions of the unblocked loop in exactly its order -- the blocks
+/// only change which entries are worked on while a tile sits in L1.
 #[inline(never)]
 fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
-    for j in 0..d {
+    // tile[p][jj] = L[j0 + jj][p0 + p]: the panel's rows over one block of
+    // earlier columns, packed so sixteen columns load side by side.
+    let mut tile = [[0f64; PANEL]; PANEL];
+    let mut j0 = 0;
+    while j0 < d {
+        let j1 = (j0 + PANEL).min(d);
+        let w = j1 - j0;
+        let mut p0 = 0;
+        while p0 < j0 {
+            for (p, t) in tile.iter_mut().enumerate() {
+                for (jj, v) in t.iter_mut().enumerate() {
+                    *v = if jj < w {
+                        a[(j0 + jj) * d + p0 + p]
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            for i in j0..d {
+                let jn = (i + 1).min(j1) - j0;
+                update_row(&mut a[i * d..i * d + j1], p0, j0, jn, &tile);
+            }
+            p0 += PANEL;
+        }
+        if !factor_panel(a, d, j0, j1) {
+            return false;
+        }
+        j0 = j1;
+    }
+    true
+}
+
+/// `row[j0 + jj] -= Σ_p row[p0 + p] · tile[p][jj]` for `jj < jn`, the sum
+/// over `p` in order: sixteen independent accumulators side by side, each
+/// subtracted exactly as the unblocked loop subtracts. Lanes at or past
+/// `jn` compute and are dropped.
+#[inline(never)]
+fn update_row(row: &mut [f64], p0: usize, j0: usize, jn: usize, tile: &[[f64; PANEL]; PANEL]) {
+    let mut acc = [0f64; PANEL];
+    acc[..jn].copy_from_slice(&row[j0..j0 + jn]);
+    let x = &row[p0..p0 + PANEL];
+    for (&xp, t) in x.iter().zip(tile) {
+        for (s, &y) in acc.iter_mut().zip(t) {
+            *s -= xp * y;
+        }
+    }
+    row[j0..j0 + jn].copy_from_slice(&acc[..jn]);
+}
+
+/// Finish columns `from..to`: subtract the products over columns
+/// `from..j` (everything before `from` was subtracted already, in order),
+/// then take the root and divide. With `from = 0, to = d` this is the whole
+/// unblocked factor.
+#[inline(never)]
+fn factor_panel(a: &mut [f64], d: usize, from: usize, to: usize) -> bool {
+    for j in from..to {
         // The row's prefix as a slice: the same subtractions in the same
         // order, without a bounds check on each of two indexings per trip.
         let mut s = a[j * d + j];
-        for &v in &a[j * d..j * d + j] {
+        for &v in &a[j * d + from..j * d + j] {
             s -= v * v;
         }
         if s <= 0.0 || !s.is_finite() {
@@ -271,11 +336,11 @@ fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
         let mut i = j + 1;
         while i + 4 <= d {
             let s = {
-                let rj = &a[j * d..j * d + j];
-                let r0 = &a[i * d..i * d + j];
-                let r1 = &a[(i + 1) * d..(i + 1) * d + j];
-                let r2 = &a[(i + 2) * d..(i + 2) * d + j];
-                let r3 = &a[(i + 3) * d..(i + 3) * d + j];
+                let rj = &a[j * d + from..j * d + j];
+                let r0 = &a[i * d + from..i * d + j];
+                let r1 = &a[(i + 1) * d + from..(i + 1) * d + j];
+                let r2 = &a[(i + 2) * d + from..(i + 2) * d + j];
+                let r3 = &a[(i + 3) * d + from..(i + 3) * d + j];
                 let mut s = [
                     a[i * d + j],
                     a[(i + 1) * d + j],
@@ -299,7 +364,7 @@ fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
             // Both rows' prefixes as slices, zipped: the same order, no
             // bounds check per trip; the write waits until they are done.
             let s = {
-                let (row_i, row_j) = (&a[i * d..i * d + j], &a[j * d..j * d + j]);
+                let (row_i, row_j) = (&a[i * d + from..i * d + j], &a[j * d + from..j * d + j]);
                 let mut s = a[i * d + j];
                 for (&x, &y) in row_i.iter().zip(row_j) {
                     s -= x * y;
