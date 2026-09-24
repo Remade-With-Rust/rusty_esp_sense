@@ -96,6 +96,27 @@ impl Model {
         window: WindowConfig,
         cfg: FitConfig,
     ) -> crate::Result<Self> {
+        Self::fit_with(data, targets, labels, subcarriers, window, cfg, None)
+    }
+
+    /// [`Model::fit`], borrowing an encoder already generated for the same
+    /// seed and widths. The encoder is a pure function of those three
+    /// numbers, so a caller fitting many models (the benchmark's folds)
+    /// generates it once; one that does not match is ignored and a fresh
+    /// one generated, so a wrong hint costs time, never correctness.
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::fit`].
+    pub fn fit_with(
+        data: &[Vec<f32>],
+        targets: &[usize],
+        labels: Vec<String>,
+        subcarriers: usize,
+        window: WindowConfig,
+        cfg: FitConfig,
+        encoder: Option<&RandomFeatures>,
+    ) -> crate::Result<Self> {
         let k = labels.len();
         if data.is_empty() || data.len() != targets.len() || k < 2 {
             return Err(crate::Error::Input(format!(
@@ -110,10 +131,12 @@ impl Model {
         let width = window.width(subcarriers);
         let x = stack(data, width)?;
         let input = Standardize::fit(&x)?;
-        let encoder = if cfg.features > 0 {
-            Some(RandomFeatures::new(cfg.seed, width, cfg.features)?)
-        } else {
-            None
+        let encoder = match encoder {
+            _ if cfg.features == 0 => None,
+            Some(e) if e.seed == cfg.seed && e.input == width && e.output == cfg.features => {
+                Some(e.clone())
+            }
+            _ => Some(RandomFeatures::new(cfg.seed, width, cfg.features)?),
         };
         let phi = Self::encode_with(&input, encoder.as_ref(), &x)?;
         let y: Vec<f32> = targets

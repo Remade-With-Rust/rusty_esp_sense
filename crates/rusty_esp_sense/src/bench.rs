@@ -37,6 +37,7 @@ use rusty_esp_signal_core::radar::csi::{Config as DetectorConfig, PresenceDetect
 use rusty_esp_signal_core::radar::csi_stream::TAG_C6_HT20_NATURAL;
 
 use crate::capture::{self, Capture};
+use crate::encoder::RandomFeatures;
 use crate::model::{FitConfig, Model};
 use crate::prof::{self, Counter, Stage};
 use crate::window::{self, WindowConfig};
@@ -308,7 +309,12 @@ fn called_occupied(model: &Model, windows: &[Vec<f32>]) -> crate::Result<Vec<boo
         .collect())
 }
 
-fn fit_on(prepared: &[&Prepared], subcarriers: usize, cfg: &BenchConfig) -> crate::Result<Model> {
+fn fit_on(
+    prepared: &[&Prepared],
+    subcarriers: usize,
+    cfg: &BenchConfig,
+    encoder: Option<&RandomFeatures>,
+) -> crate::Result<Model> {
     let (data, targets) = {
         let _g = prof::scope(Stage::Gather);
         let mut data = Vec::new();
@@ -322,13 +328,14 @@ fn fit_on(prepared: &[&Prepared], subcarriers: usize, cfg: &BenchConfig) -> crat
         }
         (data, targets)
     };
-    Model::fit(
+    Model::fit_with(
         &data,
         &targets,
         vec!["empty".into(), "occupied".into()],
         subcarriers,
         cfg.window,
         cfg.fit,
+        encoder,
     )
 }
 
@@ -372,6 +379,18 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
         });
     }
 
+    // One encoder for every fit below: it depends on the seed and the widths
+    // only, and was generated seven times before (docs/PERF.md).
+    let encoder = if cfg.fit.features > 0 {
+        Some(RandomFeatures::new(
+            cfg.fit.seed,
+            cfg.window.width(subcarriers),
+            cfg.fit.features,
+        )?)
+    } else {
+        None
+    };
+
     // Held out, fold by fold.
     let mut held = Vec::new();
     for f in 0..folds {
@@ -380,7 +399,7 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
         if test.is_empty() {
             continue;
         }
-        let model = fit_on(&train, subcarriers, cfg)?;
+        let model = fit_on(&train, subcarriers, cfg, encoder.as_ref())?;
         for p in test {
             held.push((p.scenario, called_occupied(&model, &p.windows)?));
         }
@@ -393,7 +412,7 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
         .collect();
     let mut confound = Vec::new();
     if !e12.is_empty() {
-        let model = fit_on(&e12, subcarriers, cfg)?;
+        let model = fit_on(&e12, subcarriers, cfg, encoder.as_ref())?;
         for p in prepared
             .iter()
             .filter(|p| matches!(p.scenario, Scenario::Traffic | Scenario::Coexistence))
@@ -404,7 +423,7 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
 
     // A model calibrated on everything: its file's size.
     let all: Vec<&Prepared> = prepared.iter().collect();
-    let model = fit_on(&all, subcarriers, cfg)?;
+    let model = fit_on(&all, subcarriers, cfg, encoder.as_ref())?;
     let path = std::env::temp_dir().join(format!(
         "rusty_esp_sense-bench-{}.safetensors",
         std::process::id()
