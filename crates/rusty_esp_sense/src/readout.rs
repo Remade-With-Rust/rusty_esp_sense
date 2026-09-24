@@ -114,7 +114,9 @@ impl Ridge {
         let (mut gram, rhs) = {
             let _g = prof::scope(Stage::Gram);
             prof::add(Counter::GramMacs, (n * d * d + n * d * outputs) as u64);
-            let zt = z.t()?.contiguous()?;
+            // The transposed VIEW: the multiply reads it by stride, so the
+            // full transposed copy `.contiguous()` made is not needed.
+            let zt = z.t()?;
             let gram: Vec<f64> = zt.matmul(&z)?.flatten_all()?.to_vec1()?;
             let rhs: Vec<f64> = zt.matmul(&yc)?.flatten_all()?.to_vec1()?;
             (gram, rhs)
