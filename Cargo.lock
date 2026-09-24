@@ -3463,6 +3463,7 @@ version = "0.1.0"
 dependencies = [
  "candle-core",
  "memchr",
+ "rayon",
  "rusty_esp_iroh-host",
  "rusty_esp_signal-core",
  "serde_json",

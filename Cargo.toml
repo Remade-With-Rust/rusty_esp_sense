@@ -28,6 +28,10 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 # The tensor spine (house rule: candle for every non-LLM model). CPU only:
 # no `cuda` / `metal`, which would pull C toolchains in.
 candle-core = { version = "0.11", default-features = false }
+# Data parallelism for the host pipeline: captures, recordings and fits are
+# independent, and every result is collected in index order. Already in the
+# tree through candle.
+rayon = "1.10"
 serde_json = "1"
 
 [profile.release]

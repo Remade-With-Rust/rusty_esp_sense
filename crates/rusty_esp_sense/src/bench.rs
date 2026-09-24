@@ -42,6 +42,7 @@ use crate::model::{FitConfig, Model};
 use crate::prof::{self, Counter, Stage};
 use crate::readout::{Ridge, Standardize};
 use crate::window::{WindowBuilder, WindowConfig, Windows};
+use rayon::prelude::*;
 
 /// The dataset's frame interval: 50 Hz.
 pub const FRAME_US: u64 = 20_000;
@@ -122,7 +123,11 @@ pub struct Recording {
 /// [`crate::Error::Io`] when a folder or file cannot be read;
 /// [`crate::Error::Input`] when no capture was found.
 pub fn load(root: &Path) -> crate::Result<Vec<Recording>> {
-    let mut out = Vec::new();
+    // The folder walk names the files; the files then parse in parallel,
+    // one per task. Each parse is a pure function of its file, the results
+    // come back in walk order, and the first failure in walk order is the
+    // one returned -- as the sequential loop returned it.
+    let mut found = Vec::new();
     for dir in std::fs::read_dir(root)? {
         let dir = dir?.path();
         if !dir.is_dir() {
@@ -144,13 +149,22 @@ pub fn load(root: &Path) -> crate::Result<Vec<Recording>> {
                 continue;
             };
             let day = rest.split('_').nth(1).unwrap_or("").to_owned();
-            let capture = capture::read(&path, TAG_C6_HT20_NATURAL, FRAME_US)?;
-            out.push(Recording {
+            found.push((path, scenario, day));
+        }
+    }
+    let parsed: Vec<crate::Result<Recording>> = found
+        .into_par_iter()
+        .map(|(path, scenario, day)| {
+            Ok(Recording {
                 scenario,
                 day,
-                capture,
-            });
-        }
+                capture: capture::read(&path, TAG_C6_HT20_NATURAL, FRAME_US)?,
+            })
+        })
+        .collect();
+    let mut out = Vec::with_capacity(parsed.len());
+    for r in parsed {
+        out.push(r?);
     }
     if out.is_empty() {
         return Err(crate::Error::Input(format!(

@@ -28,6 +28,7 @@ profile = []
 [dependencies]
 rusty_esp_signal-core = { workspace = true, features = ["std"] }
 candle-core = { workspace = true }
+rayon = { workspace = true }
 serde_json = { workspace = true }
 memchr = "2.7"
 rusty_esp_iroh-host = { workspace = true, optional = true }
