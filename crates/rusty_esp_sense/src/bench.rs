@@ -295,8 +295,11 @@ fn prepare(c: &Capture, cfg: WindowConfig) -> (Windows, Vec<bool>) {
     let frames = cfg.frames.max(1);
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
     let mut b = WindowBuilder::new(cfg);
-    let mut data = Vec::new();
-    let mut calls = Vec::new();
+    // At most one window and one call per `frames` samples: sized once, not
+    // grown by doubling (a fresh allocation and a copy each time).
+    let most = c.samples.len() / frames + 1;
+    let mut data = Vec::with_capacity(most);
+    let mut calls = Vec::with_capacity(most);
     let mut seen = 0usize;
     for s in &c.samples {
         let norm = s.features().ok().map(|f| f.normalised());
