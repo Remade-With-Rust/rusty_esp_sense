@@ -232,12 +232,15 @@ fn add_squared_deviations(acc: &mut [f32], row: &[f32], mean: &[f32]) {
 }
 
 /// The window subcarrier-major, from `frames` (frame-major).
+#[inline(never)]
 fn flatten(frames: &[f32], t: usize, s: usize, centre: bool) -> Vec<f32> {
+    debug_assert_eq!(frames.len(), t * s);
     let mut w = vec![0f32; s * t];
-    for k in 0..s {
-        let row = &mut w[k * t..(k + 1) * t];
-        for (j, v) in row.iter_mut().enumerate() {
-            *v = frames[j * s + k];
+    for (k, row) in (0..s).zip(w.chunks_exact_mut(t.max(1))) {
+        // Subcarrier k of every frame. Each frame is an exact chunk of `s`
+        // and `k < s`, so the column read carries no check.
+        for (v, f) in row.iter_mut().zip(frames.chunks_exact(s)) {
+            *v = f[k];
         }
         if centre {
             let mean = row.iter().sum::<f32>() / t as f32;
