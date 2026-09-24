@@ -146,11 +146,11 @@ impl Ridge {
         let yc = Tensor::from_vec(yc, (n, outputs), &Device::Cpu)?;
         let (mut gram, rhs) = {
             let _g = prof::scope(Stage::Gram);
-            prof::add(Counter::GramMacs, (n * d * d + n * d * outputs) as u64);
+            prof::add(Counter::GramMacs, (n * d * outputs) as u64);
             // The transposed VIEW: the multiply reads it by stride, so the
             // full transposed copy `.contiguous()` made is not needed.
             let zt = z.t()?;
-            let gram: Vec<f64> = zt.matmul(&z)?.flatten_all()?.to_vec1()?;
+            let gram = lower_gram(&zt, &z, d)?;
             let rhs: Vec<f64> = zt.matmul(&yc)?.flatten_all()?.to_vec1()?;
             (gram, rhs)
         };
@@ -186,6 +186,33 @@ impl Ridge {
         let icpt = Tensor::from_slice(&self.intercept, self.outputs, &Device::Cpu)?;
         Ok(z.matmul(&beta)?.broadcast_add(&icpt)?)
     }
+}
+
+/// Rows of `ZᵀZ` computed per panel: GRAM_PANEL rows of `Zᵀ` against only
+/// the columns up to the panel's end. The Cholesky reads the lower triangle
+/// alone, so the rest of the square is never computed; it stays zero.
+const GRAM_PANEL: usize = 128;
+
+fn lower_gram(zt: &Tensor, z: &Tensor, d: usize) -> crate::Result<Vec<f64>> {
+    let mut gram = vec![0f64; d * d];
+    let mut r0 = 0;
+    while r0 < d {
+        let r1 = (r0 + GRAM_PANEL).min(d);
+        prof::add(Counter::GramMacs, (z.dim(0)? * (r1 - r0) * r1) as u64);
+        let block: Vec<f64> = zt
+            .narrow(0, r0, r1 - r0)?
+            .matmul(&z.narrow(1, 0, r1)?)?
+            .flatten_all()?
+            .to_vec1()?;
+        for (row, src) in gram[r0 * d..r1 * d]
+            .chunks_exact_mut(d)
+            .zip(block.chunks_exact(r1))
+        {
+            row[..r1].copy_from_slice(src);
+        }
+        r0 = r1;
+    }
+    Ok(gram)
 }
 
 /// Solve `A X = B` for symmetric positive definite `A` (`d × d`, row-major,
