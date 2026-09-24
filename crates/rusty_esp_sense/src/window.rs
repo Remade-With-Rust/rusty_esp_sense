@@ -235,13 +235,15 @@ fn add_squared_deviations(acc: &mut [f32], row: &[f32], mean: &[f32]) {
 #[inline(never)]
 fn flatten(frames: &[f32], t: usize, s: usize, centre: bool) -> Vec<f32> {
     debug_assert_eq!(frames.len(), t * s);
-    let mut w = vec![0f32; s * t];
-    for (k, row) in (0..s).zip(w.chunks_exact_mut(t.max(1))) {
+    // Appended row by row, each value written once: zero-filling the
+    // window first wrote all of it twice.
+    let mut w = Vec::with_capacity(s * t);
+    for k in 0..s {
         // Subcarrier k of every frame. Each frame is an exact chunk of `s`
         // and `k < s`, so the column read carries no check.
-        for (v, f) in row.iter_mut().zip(frames.chunks_exact(s)) {
-            *v = f[k];
-        }
+        let at = w.len();
+        w.extend(frames.chunks_exact(s).map(|f| f[k]));
+        let row = &mut w[at..];
         if centre {
             let mean = row.iter().sum::<f32>() / t as f32;
             for v in row.iter_mut() {
@@ -254,6 +256,55 @@ fn flatten(frames: &[f32], t: usize, s: usize, centre: bool) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
+    /// C10's probe: `flatten` as it was (the window zero-filled, then
+    /// written) against the single write, at the raw benchmark's window
+    /// size, over as many windows as the benchmark cuts. Timing, best of N;
+    /// not a gate (the golden hashes are).
+    #[test]
+    #[ignore = "timing probe"]
+    fn probe_flatten_single_write() {
+        fn zero_filled(frames: &[f32], t: usize, s: usize, centre: bool) -> Vec<f32> {
+            let mut w = vec![0f32; s * t];
+            for (k, row) in (0..s).zip(w.chunks_exact_mut(t.max(1))) {
+                for (v, f) in row.iter_mut().zip(frames.chunks_exact(s)) {
+                    *v = f[k];
+                }
+                if centre {
+                    let mean = row.iter().sum::<f32>() / t as f32;
+                    for v in row.iter_mut() {
+                        *v -= mean;
+                    }
+                }
+            }
+            w
+        }
+        let (t, s, windows) = (50usize, 56usize, 5904usize);
+        let frames: Vec<f32> = (0..t * s).map(|i| (i % 97) as f32 / 97.0).collect();
+        for centre in [false, true] {
+            let (mut old, mut new) = (u128::MAX, u128::MAX);
+            for _ in 0..15 {
+                let clock = std::time::Instant::now();
+                let mut keep = Vec::with_capacity(windows);
+                for _ in 0..windows {
+                    keep.push(zero_filled(std::hint::black_box(&frames), t, s, centre));
+                }
+                old = old.min(clock.elapsed().as_micros());
+                let a = std::hint::black_box(keep);
+                let clock = std::time::Instant::now();
+                let mut keep = Vec::with_capacity(windows);
+                for _ in 0..windows {
+                    keep.push(super::flatten(std::hint::black_box(&frames), t, s, centre));
+                }
+                new = new.min(clock.elapsed().as_micros());
+                assert_eq!(a[0], keep[0]);
+            }
+            println!(
+                "probe centre={centre}: zero-filled {old} us, single write {new} us, ratio {:.3}",
+                new as f64 / old as f64
+            );
+        }
+    }
+
     use rusty_esp_signal_core::esp_core::Micros;
     use rusty_esp_signal_core::radar::csi_stream::{TAG_LLTF_20MHZ, TAG_UNKNOWN};
 
