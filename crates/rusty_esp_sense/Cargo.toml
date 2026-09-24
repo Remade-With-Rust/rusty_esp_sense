@@ -16,7 +16,13 @@ categories = ["science", "command-line-utilities"]
 publish = false
 
 [features]
-default = []
+default = ["rusty-alloc"]
+# The binary's allocator is rusty_alloc (the library never declares one).
+# It keeps freed segments committed, so the megabyte-scale buffers every fit
+# makes come back as warm pages: the benchmark runs 5-8 % faster and its
+# peak working set is larger (docs/PERF.md). Without the feature the binary
+# uses the system allocator.
+rusty-alloc = ["dep:rusty_alloc-api"]
 # `rusty_esp_sense watch <ticket>`: subscribe to a device's (or a bridge's)
 # W5 CSI stream over iroh and read the room live. Off by default so the
 # offline build carries no network stack.
@@ -29,6 +35,9 @@ profile = []
 rusty_esp_signal-core = { workspace = true, features = ["std"] }
 candle-core = { workspace = true }
 rayon = { workspace = true }
+# The binary's allocator (the library declares none; feature `rusty-alloc`):
+# the Remade With Rust family's pure-Rust allocator.
+rusty_alloc-api = { version = "2.2", optional = true }
 serde_json = { workspace = true }
 memchr = "2.7"
 rusty_esp_iroh-host = { workspace = true, optional = true }

@@ -111,7 +111,12 @@ impl Args {
 #[cfg(feature = "profile")]
 mod census {
     use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::alloc::{GlobalAlloc, Layout};
+
+    #[cfg(feature = "rusty-alloc")]
+    use rusty_alloc_api::RustyAlloc as Inner;
+    #[cfg(not(feature = "rusty-alloc"))]
+    use std::alloc::System as Inner;
 
     pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
     pub static BYTES: AtomicU64 = AtomicU64::new(0);
@@ -120,7 +125,7 @@ mod census {
 
     pub struct Counting;
 
-    // SAFETY: every call forwards to `System` with the caller's own layout
+    // SAFETY: every call forwards to the allocator (`Inner`) with the caller's own layout
     // and pointer, unchanged; the counters are atomics and never touch the
     // memory handed out.
     #[allow(unsafe_code)]
@@ -131,12 +136,12 @@ mod census {
             let live = LIVE.fetch_add(l.size() as u64, Relaxed) + l.size() as u64;
             PEAK.fetch_max(live, Relaxed);
             // SAFETY: the caller's contract, passed through.
-            unsafe { System.alloc(l) }
+            unsafe { Inner.alloc(l) }
         }
         unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
             LIVE.fetch_sub(l.size() as u64, Relaxed);
             // SAFETY: the caller's contract, passed through.
-            unsafe { System.dealloc(p, l) }
+            unsafe { Inner.dealloc(p, l) }
         }
     }
 
@@ -152,6 +157,14 @@ mod census {
         )
     }
 }
+
+/// The allocator: `rusty_alloc` keeps freed segments committed for reuse,
+/// so the megabyte-scale buffers every fit makes (candle's products, gemm's
+/// packing space) come back as warm pages instead of fresh ones from the OS.
+/// Profile builds count through the census, which forwards to it.
+#[cfg(all(feature = "rusty-alloc", not(feature = "profile")))]
+#[global_allocator]
+static ALLOC: rusty_alloc_api::RustyAlloc = rusty_alloc_api::RustyAlloc;
 
 fn main() -> ExitCode {
     let code = {
