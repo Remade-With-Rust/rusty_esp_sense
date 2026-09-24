@@ -183,16 +183,52 @@ pub fn windows(samples: &[Sample], cfg: WindowConfig) -> Windows {
 }
 
 /// Each subcarrier's standard deviation over the `t` frames of `frames`
-/// (frame-major). The sums run over frames in order, as they always have.
+/// (frame-major).
+///
+/// Vertical: every subcarrier's accumulator side by side, advanced one
+/// frame at a time over contiguous rows. Each subcarrier's sums still run
+/// over its frames in order, from the `-0.0` that `Iterator::sum` starts
+/// floats at, so the result is bit for bit the per-subcarrier loops it
+/// replaced -- which walked down the buffer with a stride of `s`.
+#[inline(never)]
 fn wander(frames: &[f32], t: usize, s: usize) -> Vec<f32> {
     let tf = t as f32;
-    (0..s)
-        .map(|k| {
-            let at = |j: usize| frames[j * s + k];
-            let mean = (0..t).map(at).sum::<f32>() / tf;
-            ((0..t).map(|j| (at(j) - mean).powi(2)).sum::<f32>() / tf).sqrt()
-        })
-        .collect()
+    let mut mean = vec![-0.0f32; s];
+    for row in frames.chunks_exact(s).take(t) {
+        add_row(&mut mean, row);
+    }
+    for m in &mut mean {
+        *m /= tf;
+    }
+    let mut var = vec![-0.0f32; s];
+    for row in frames.chunks_exact(s).take(t) {
+        add_squared_deviations(&mut var, row, &mean);
+    }
+    for v in &mut var {
+        *v = (*v / tf).sqrt();
+    }
+    var
+}
+
+/// `acc[k] += row[k]`. Each lane is its own accumulator: nothing is
+/// reassociated. Its own frame on purpose: with `acc` and `row` arriving as
+/// separate non-aliasing parameters the loop vectorises (packed adds);
+/// inlined into [`wander`] the compiler lost that proof and every element
+/// went scalar (census: 30 instructions per eight, all `addss`).
+#[inline(never)]
+fn add_row(acc: &mut [f32], row: &[f32]) {
+    for (a, &r) in acc.iter_mut().zip(row) {
+        *a += r;
+    }
+}
+
+/// `acc[k] += (row[k] - mean[k])²`, as [`add_row`].
+#[inline(never)]
+fn add_squared_deviations(acc: &mut [f32], row: &[f32], mean: &[f32]) {
+    for ((a, &r), &m) in acc.iter_mut().zip(row).zip(mean) {
+        let dev = r - m;
+        *a += dev * dev;
+    }
 }
 
 /// The window subcarrier-major, from `frames` (frame-major).
@@ -296,6 +332,40 @@ mod tests {
         );
         assert_eq!(w.skipped, 1);
         assert_eq!(w.data.len(), 1);
+    }
+
+    /// V6's oracle: the vertical wander equals the per-subcarrier iterator
+    /// sums it replaced, bit for bit, over sizes and values that include
+    /// exact zeros.
+    #[test]
+    fn vertical_wander_matches_the_per_subcarrier_sums() {
+        let reference = |frames: &[f32], t: usize, s: usize| -> Vec<f32> {
+            let tf = t as f32;
+            (0..s)
+                .map(|k| {
+                    let at = |j: usize| frames[j * s + k];
+                    let mean = (0..t).map(at).sum::<f32>() / tf;
+                    ((0..t).map(|j| (at(j) - mean).powi(2)).sum::<f32>() / tf).sqrt()
+                })
+                .collect()
+        };
+        for (t, s) in [(1, 1), (2, 3), (50, 56), (50, 52), (7, 64), (100, 56)] {
+            let frames: Vec<f32> = (0..t * s)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        0.0
+                    } else {
+                        ((i * 2_654_435_761) % 4096) as f32 / 1024.0
+                    }
+                })
+                .collect();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&wander(&frames, t, s)),
+                bits(&reference(&frames, t, s)),
+                "t {t} s {s}"
+            );
+        }
     }
 
     #[test]
