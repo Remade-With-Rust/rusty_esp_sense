@@ -394,3 +394,69 @@ has been timed.**
 moved about 20 MB in a path the change did not touch. Three reruns
 reproduced the previous figure both times. Rerun any census delta a
 change cannot explain before recording it.
+
+# Fresh pages: A to E
+
+The Q series cut allocation COUNTS, and wall time did not move. Pricing the
+removed pattern explained why. On the Windows system allocator a 224-byte
+allocation costs 31-37 ns, an 11.2 KB one about 1.4 us, and a fresh
+megabyte-scale buffer about **15 ms per 100 MB** in first-touch page faults,
+compared with a reused buffer. A throwaway per-phase size histogram then
+showed that almost all of a run's bytes are buffers of 1 MB or more. These
+five changes follow the bytes. Each passed the golden gate at 24, 4 and 1
+threads.
+
+| change | what stopped | deterministic evidence | time, 1 thread, paired |
+|---|---|---|---|
+| A | a fresh 1.2 MB read buffer per capture | −116 MB fresh bytes, every command | bench-fall 715 → 680 ms, 13/16, z 2.50 |
+| E | a window builder, its 11.2 KB frame buffer and scratch per recording | −196 allocations, −1.1 MB | ~0.14 ms, below the clock |
+| C | a second buffer for the encoder's output (19 MB per fold) and scoring's features | −185 MB fresh bytes, raw peak −19 MB | touched stages 133 → 93 ms, 16/16, z 4.00 |
+| D | a fresh Gram matrix and Cholesky panel per fit | −42 MB fresh bytes at one thread | ~6 ms, below the clock |
+| B | fresh pages for buffers this crate cannot reuse (gemm's packing, candle's products) | not visible to a request census | bench-cuenca 1,945 → 1,759 ms, 15/16, z 3.50 |
+
+**bench-cuenca now allocates 505 MB per single-threaded run, down from
+849 MB before A.**
+
+**Mechanisms:**
+
+- **A.** `capture::read_into` reads through a caller's buffer. The loader
+  gives each pool thread one contiguous run of files and one buffer.
+  `map_init` made one per work-stealing split, 27 at one thread.
+- **E.** `WindowBuilder::reset` keeps the builder's buffers, and each thread
+  prepares its run of recordings through one builder.
+- **C.** candle 0.11's `Tensor::inplace_op1` is public and safe.
+  `host::rewrite_f32` rewrites a tensor that only the caller holds, in its
+  own buffer.
+- **D.** A per-thread scratch holds the Gram matrix and the Cholesky panel.
+  Each fit takes it out of its thread-local cell rather than borrowing it,
+  because rayon can steal another fit onto the same thread while a multiply
+  waits, and that fit finds the cell empty.
+- **B.** `gemm` allocates a packing buffer per multiply and offers no way to
+  pass one in, so the allocator is the only lever. `rusty_alloc` becomes the
+  binary's allocator under the default feature `rusty-alloc`.
+
+**The cost of B is resident memory.** Retained segments raise the peak
+working set:
+
+| configuration | system allocator | rusty_alloc |
+|---|---:|---:|
+| default, 1 thread | 115 MB | 144 MB |
+| raw, 1 thread | 201 MB | 273 MB |
+| default, 24 threads | 419 MB | 484 MB |
+| raw, 24 threads | 509 MB | 717 MB |
+
+`--no-default-features` restores the system allocator. Its output is also
+byte-identical.
+
+**Found on the way, and not claimed away.**
+
+- **C made an untouched stage slower.** After C, the Parse stage read 10 %
+  slower (0/12 pairs, z −3.46) with its source unchanged, while a null arm
+  of A against a byte-identical copy of A read flat. Building both sides
+  with `-C llvm-args=-align-loops=64` shrank the gap to 2.9 %, so it is code
+  layout. A net-positive change can still cost an unrelated hot loop some
+  alignment luck. Time the stages it does not touch as well.
+- **Today's box was saturated.** Another process held the CPU at 100 %, and
+  P7's own 24-thread fall benchmark read 206-258 ms against 69 ms on a quiet
+  box. Every 24-thread timing from today is inadmissible, so the verdicts
+  above rest on byte counts and single-thread pairs only.

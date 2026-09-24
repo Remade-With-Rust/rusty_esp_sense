@@ -124,6 +124,13 @@ do not depend on the thread count, only time and memory do.
 memory: in the raw-window configuration, 664 MB with all six at once and
 264 MB one at a time.
 
+**Allocator.** The binary allocates through
+[`rusty_alloc`](https://crates.io/crates/rusty_alloc), the family's pure-Rust
+allocator. It keeps freed memory for reuse, which makes the benchmark 5-8 %
+faster and raises its peak working set, for example from 115 MB to 144 MB on
+one thread. `cargo build --no-default-features` gives the system allocator.
+The library never chooses an allocator.
+
 **Calibrate with the room's normal network traffic running.** Calibrated on
 four minutes without traffic, it called 13 of 60 windows of a 10 Mbps
 capture occupied.
