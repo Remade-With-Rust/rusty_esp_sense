@@ -31,6 +31,7 @@ pub type Stream = Vec<(Micros, u16)>;
 pub fn wander_stream(r: &Recording) -> Stream {
     let _g = prof::scope(Stage::Detector);
     prof::add(Counter::DetectorPushes, r.capture.samples.len() as u64);
+    prof::add(Counter::FeatureComputations, r.capture.samples.len() as u64);
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
     let mut out = Vec::with_capacity(r.capture.samples.len());
     for s in &r.capture.samples {
@@ -59,6 +60,7 @@ pub fn events(stream: &Stream, config: FallConfig) -> usize {
 /// The `len` consecutive frames of `stream` with the most at or above
 /// `active`.
 fn most_active(stream: &Stream, len: usize, active: u16) -> &[(Micros, u16)] {
+    prof::add(Counter::ActiveScans, 1);
     if stream.len() <= len {
         return stream;
     }

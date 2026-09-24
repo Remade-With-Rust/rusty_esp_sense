@@ -266,6 +266,7 @@ struct Prepared {
 fn detector_calls(c: &Capture, frames: usize) -> Vec<bool> {
     let _g = prof::scope(Stage::Detector);
     prof::add(Counter::DetectorPushes, c.samples.len() as u64);
+    prof::add(Counter::FeatureComputations, c.samples.len() as u64);
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
     let mut calls = Vec::new();
     let mut seen = 0usize;

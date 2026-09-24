@@ -111,10 +111,20 @@ pub enum Counter {
     SampleCopies,
     /// Tensors built from host slices.
     TensorBuilds,
+    /// `CsiFrame::features` computations (per frame, per consumer).
+    FeatureComputations,
+    /// Bytes validated as UTF-8 on the way in.
+    Utf8Bytes,
+    /// Fields parsed through the generic `str::parse`.
+    FieldParses,
+    /// Readout prediction multiply-adds.
+    PredictMacs,
+    /// Most-active-stretch scans in the fall bench's splices.
+    ActiveScans,
 }
 
 /// Counters, in report order.
-pub const COUNTERS: [Counter; 15] = [
+pub const COUNTERS: [Counter; 20] = [
     Counter::Rows,
     Counter::FramesWindowed,
     Counter::FrameVecs,
@@ -130,6 +140,11 @@ pub const COUNTERS: [Counter; 15] = [
     Counter::FallPushes,
     Counter::SampleCopies,
     Counter::TensorBuilds,
+    Counter::FeatureComputations,
+    Counter::Utf8Bytes,
+    Counter::FieldParses,
+    Counter::PredictMacs,
+    Counter::ActiveScans,
 ];
 
 #[cfg(feature = "profile")]
@@ -141,7 +156,7 @@ mod imp {
 
     static NS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
     static CALLS: [AtomicU64; 18] = [const { AtomicU64::new(0) }; 18];
-    static COUNT: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+    static COUNT: [AtomicU64; 20] = [const { AtomicU64::new(0) }; 20];
 
     /// Times a stage while alive.
     pub struct Guard(Stage, Instant);

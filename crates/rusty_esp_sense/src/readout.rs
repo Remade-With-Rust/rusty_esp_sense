@@ -128,6 +128,10 @@ impl Ridge {
         let z = self.norm.apply(&phi.to_dtype(DType::F32)?)?;
         let _g = prof::scope(Stage::Predict);
         prof::add(Counter::TensorBuilds, 2);
+        prof::add(
+            Counter::PredictMacs,
+            (z.dim(0)? * self.norm.mean.len() * self.outputs) as u64,
+        );
         let d = self.norm.mean.len();
         let beta = Tensor::from_slice(&self.beta, (d, self.outputs), &Device::Cpu)?;
         let icpt = Tensor::from_slice(&self.intercept, self.outputs, &Device::Cpu)?;

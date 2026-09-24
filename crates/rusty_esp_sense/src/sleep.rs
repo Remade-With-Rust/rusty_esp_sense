@@ -115,6 +115,7 @@ pub fn epochs(samples: &[Sample], cfg: &NightConfig) -> Vec<Epoch> {
     let _g = prof::scope(Stage::Night);
     prof::add(Counter::DetectorPushes, samples.len() as u64);
     prof::add(Counter::VitalsPushes, samples.len() as u64);
+    prof::add(Counter::FeatureComputations, samples.len() as u64);
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
     let mut vit: Box<VitalsEstimator<200>> =
         Box::new(VitalsEstimator::new(VitalsConfig::breathing(cfg.frame_hz)));

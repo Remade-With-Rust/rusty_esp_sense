@@ -88,6 +88,7 @@ pub fn windows(samples: &[Sample], cfg: WindowConfig) -> Windows {
     let mut out = Windows::default();
     let mut frames: Vec<Vec<f32>> = Vec::with_capacity(t);
     for s in samples {
+        prof::add(Counter::FeatureComputations, 1);
         let Ok(f) = s.features() else {
             out.skipped += 1;
             continue;

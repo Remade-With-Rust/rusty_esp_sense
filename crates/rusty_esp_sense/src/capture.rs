@@ -68,7 +68,9 @@ pub fn parse(name: &str, text: &str, layout: u8, frame_us: u64) -> Capture {
 pub fn read(path: &std::path::Path, layout: u8, frame_us: u64) -> crate::Result<Capture> {
     let text = {
         let _g = prof::scope(Stage::Parse);
-        std::fs::read_to_string(path)?
+        let t = std::fs::read_to_string(path)?;
+        prof::add(Counter::Utf8Bytes, t.len() as u64);
+        t
     };
     let name = path.file_name().map_or_else(
         || path.display().to_string(),
@@ -82,12 +84,14 @@ fn row(line: &str) -> Option<(i8, [i8; MAX_IQ], usize, Option<f64>)> {
     if fields.next()? != "CSI_DATA" {
         return None;
     }
+    prof::add(Counter::FieldParses, 2);
     let rssi: i8 = fields.next()?.trim().parse().ok()?;
     let n: usize = fields.next()?.trim().parse().ok()?;
     if n > MAX_IQ {
         return None;
     }
     let mut iq = [0i8; MAX_IQ];
+    prof::add(Counter::FieldParses, n as u64);
     for slot in iq.iter_mut().take(n) {
         *slot = fields.next()?.trim().parse().ok()?;
     }
