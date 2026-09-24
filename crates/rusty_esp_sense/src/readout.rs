@@ -29,12 +29,30 @@ impl Standardize {
     /// A tensor error when `x` is not two-dimensional.
     pub fn fit(x: &Tensor) -> crate::Result<Self> {
         let _g = prof::scope(Stage::InputStd);
-        let x = x.to_dtype(DType::F64)?;
-        let n = x.dim(0)? as f64;
-        let mean = (x.sum(0)? / n)?;
-        let var = (x.broadcast_sub(&mean)?.sqr()?.sum(0)? / n)?;
-        let mean: Vec<f64> = mean.to_vec1()?;
-        let var: Vec<f64> = var.to_vec1()?;
+        // Column sums in f64, row by row, streamed from the f32 values: no
+        // f64 copy of the input, no deviations tensor, no squares tensor.
+        let (n, d) = x.dims2()?;
+        let v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let nf = n as f64;
+        let mut mean = vec![0f64; d];
+        for row in v.chunks_exact(d) {
+            for (m, &e) in mean.iter_mut().zip(row) {
+                *m += f64::from(e);
+            }
+        }
+        for m in &mut mean {
+            *m /= nf;
+        }
+        let mut var = vec![0f64; d];
+        for row in v.chunks_exact(d) {
+            for ((s, &e), &m) in var.iter_mut().zip(row).zip(&mean) {
+                let dev = f64::from(e) - m;
+                *s += dev * dev;
+            }
+        }
+        for s in &mut var {
+            *s /= nf;
+        }
         Ok(Standardize {
             mean: mean.iter().map(|&m| m as f32).collect(),
             std: var
