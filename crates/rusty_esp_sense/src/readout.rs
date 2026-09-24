@@ -252,8 +252,11 @@ fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f6
 /// Columns per panel of the blocked factor, and the side of its tile.
 const PANEL: usize = 16;
 
-/// `A = L Lᵀ`, `L` in the lower triangle of `a`; `false` when `A` is not
-/// positive definite.
+/// `A = L Lᵀ`, `L` in the lower triangle of `a` and, stored beside it as
+/// each entry is made, `Lᵀ` in the upper (`a[j][i] = L[i][j]`, `i > j`), so
+/// the back-substitutions read a row of `Lᵀ` contiguously where they walked
+/// a column of `L` a row apart per element. The factor never reads the
+/// upper triangle. `false` when `A` is not positive definite.
 ///
 /// Blocked by panels of [`PANEL`] columns, for the cache: before a panel is
 /// finished, the products over every earlier column are subtracted from it
@@ -356,7 +359,10 @@ fn factor_panel(a: &mut [f64], d: usize, from: usize, to: usize) -> bool {
                 s
             };
             for (r, v) in s.iter().enumerate() {
-                a[(i + r) * d + j] = v / ljj;
+                let l = v / ljj;
+                a[(i + r) * d + j] = l;
+                // Lᵀ in the upper triangle, row j: a sequential store.
+                a[j * d + i + r] = l;
             }
             i += 4;
         }
@@ -371,7 +377,9 @@ fn factor_panel(a: &mut [f64], d: usize, from: usize, to: usize) -> bool {
                 }
                 s
             };
-            a[i * d + j] = s / ljj;
+            let l = s / ljj;
+            a[i * d + j] = l;
+            a[j * d + i] = l;
         }
     }
     true
@@ -421,10 +429,10 @@ fn solve_back_pair(a: &[f64], d: usize, x: &mut [f64]) {
     for i in (0..d).rev() {
         let s = {
             let mut s = [x[2 * i], x[2 * i + 1]];
-            // Below row i of column i; for the last row there is nothing
-            // below, and the start index is past the matrix.
-            let column = a.get((i + 1) * d + i..).unwrap_or(&[]).iter().step_by(d);
-            for (&l, pair) in column.zip(x[2 * (i + 1)..].chunks_exact(2)) {
+            // Column i of L below the diagonal, read as row i of Lᵀ in the
+            // upper triangle (written by the factor): contiguous, the same order.
+            let column = &a[i * d + i + 1..(i + 1) * d];
+            for (&l, pair) in column.iter().zip(x[2 * (i + 1)..].chunks_exact(2)) {
                 s[0] -= l * pair[0];
                 s[1] -= l * pair[1];
             }
@@ -441,8 +449,9 @@ fn solve_back_pair(a: &[f64], d: usize, x: &mut [f64]) {
 fn solve_back(a: &[f64], d: usize, x: &mut [f64], k: usize, c: usize) {
     for i in (0..d).rev() {
         let mut s = x[i * k + c];
-        for p in i + 1..d {
-            s -= a[p * d + i] * x[p * k + c];
+        // Row i of Lᵀ (written by the factor), contiguous.
+        for (p, &l) in (i + 1..d).zip(&a[i * d + i + 1..(i + 1) * d]) {
+            s -= l * x[p * k + c];
         }
         x[i * k + c] = s / a[i * d + i];
     }
@@ -532,13 +541,85 @@ mod tests {
                 let mut ra = a0.clone();
                 assert!(cholesky_factor(&mut fa, d));
                 let _ = reference_solve(&mut ra, d, &b, k);
-                assert_eq!(bits(&fa), bits(&ra), "factor, d {d}");
+                let lower = |m: &[f64]| {
+                    (0..d)
+                        .flat_map(|i| (0..=i).map(move |j| (i, j)))
+                        .map(|(i, j)| m[i * d + j].to_bits())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(lower(&fa), lower(&ra), "factor, d {d}");
+                for i in 0..d {
+                    for j in 0..i {
+                        assert_eq!(
+                            fa[j * d + i].to_bits(),
+                            fa[i * d + j].to_bits(),
+                            "Lᵀ, d {d}"
+                        );
+                    }
+                }
             }
         }
         // Not positive definite: refused by both.
         let mut bad = vec![1.0, 2.0, 2.0, 1.0];
         assert!(cholesky_solve(&mut bad.clone(), 2, &[1.0, 1.0], 1).is_none());
         assert!(reference_solve(&mut bad, 2, &[1.0, 1.0], 1).is_none());
+    }
+
+    /// C3's probe: the back-substitution as it was (column `i` of `L`, a
+    /// row apart per element) against the contiguous walk over `Lᵀ`, which the
+    /// factor now stores as it goes (no separate pass to price). Timing,
+    /// best of N; not a gate (the oracle test is).
+    #[test]
+    #[ignore = "timing probe"]
+    fn probe_back_solve_layout() {
+        fn strided(a: &[f64], d: usize, x: &mut [f64]) {
+            for i in (0..d).rev() {
+                let mut s = [x[2 * i], x[2 * i + 1]];
+                let column = a.get((i + 1) * d + i..).unwrap_or(&[]).iter().step_by(d);
+                for (&l, pair) in column.zip(x[2 * (i + 1)..].chunks_exact(2)) {
+                    s[0] -= l * pair[0];
+                    s[1] -= l * pair[1];
+                }
+                let dii = a[i * d + i];
+                x[2 * i] = s[0] / dii;
+                x[2 * i + 1] = s[1] / dii;
+            }
+        }
+        for d in [256usize, 512, 1024, 2048] {
+            let mut a = vec![0.0f64; d * d];
+            for i in 0..d {
+                for j in 0..i {
+                    a[i * d + j] = (((i * 7919 + j * 104_729) % 997) as f64 / 997.0 - 0.5) * 0.01;
+                }
+                a[i * d + i] = 1.0 + (i % 5) as f64;
+            }
+            let x0: Vec<f64> = (0..2 * d).map(|i| (i % 7) as f64).collect();
+            let (mut old, mut new) = (f64::MAX, f64::MAX);
+            for _ in 0..9 {
+                let mut x = x0.clone();
+                let t = std::time::Instant::now();
+                strided(&a, d, &mut x);
+                old = old.min(t.elapsed().as_nanos() as f64);
+                let want = std::hint::black_box(x);
+                let mut m = a.clone();
+                let mut x = x0.clone();
+                for i in 0..d {
+                    for p in i + 1..d {
+                        m[i * d + p] = m[p * d + i];
+                    }
+                }
+                let t = std::time::Instant::now();
+                solve_back_pair(&m, d, &mut x);
+                new = new.min(t.elapsed().as_nanos() as f64);
+                assert_eq!(want, x);
+            }
+            println!(
+                "probe d={d:5}  strided {:>9.0} ns  contiguous {:>9.0} ns  ratio {:.3}",
+                old,
+                new,
+                new / old
+            );
+        }
     }
 
     /// The cache sweep (codec-analyzer #3): nanoseconds per multiply-add of
