@@ -195,8 +195,10 @@ pub fn run(recordings: &[Recording], burst: Option<u16>) -> FallReport {
         let Some(empty) = empties.get(k % empties.len().max(1)) else {
             break;
         };
+        // The same stretch for both splices: one scan, not two.
+        let stretch = most_active(walk, 500, config.active_permille);
         for with_burst in [true, false] {
-            let mut st: Stream = most_active(walk, 500, config.active_permille).to_vec();
+            let mut st: Stream = stretch.to_vec();
             let mut t = st.last().map_or(0, |(t, _)| t.0);
             if with_burst {
                 for _ in 0..25 {
