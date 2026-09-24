@@ -116,8 +116,15 @@ impl Standardize {
                 self.mean.len()
             )));
         }
-        let mut v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-        self.apply_in_place(&mut v);
+        // Read `x` where it lies and write each value once: a copy out and
+        // a second pass over the copy did the same.
+        let v = crate::host::with_f32(x, |x| {
+            let mut v = Vec::with_capacity(x.len());
+            for row in x.chunks_exact(d.max(1)) {
+                extend_standardized(&mut v, row, &self.mean, &self.std);
+            }
+            v
+        })?;
         Ok(Tensor::from_vec(v, (n, d), &Device::Cpu)?)
     }
 
@@ -129,6 +136,17 @@ impl Standardize {
             }
         }
     }
+}
+
+/// Append `(row[c] - mean[c]) / std[c]`, in f32.
+#[inline(never)]
+fn extend_standardized(out: &mut Vec<f32>, row: &[f32], mean: &[f32], std: &[f32]) {
+    out.extend(
+        row.iter()
+            .zip(mean)
+            .zip(std)
+            .map(|((&e, &m), &s)| (e - m) / s),
+    );
 }
 
 /// Append `(row[c] - mean[c]) / std[c]` in f32, widened to f64 -- exactly
