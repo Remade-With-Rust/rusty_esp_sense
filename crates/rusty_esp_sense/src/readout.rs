@@ -288,17 +288,17 @@ fn lower_gram(zt: &Tensor, z: &Tensor, d: usize) -> crate::Result<Vec<f64>> {
     while r0 < d {
         let r1 = (r0 + GRAM_PANEL).min(d);
         prof::add(Counter::GramMacs, (z.dim(0)? * (r1 - r0) * r1) as u64);
-        let block: Vec<f64> = zt
-            .narrow(0, r0, r1 - r0)?
-            .matmul(&z.narrow(1, 0, r1)?)?
-            .flatten_all()?
-            .to_vec1()?;
-        for (row, src) in gram[r0 * d..r1 * d]
-            .chunks_exact_mut(d)
-            .zip(block.chunks_exact(r1))
-        {
-            row[..r1].copy_from_slice(src);
-        }
+        let block = zt.narrow(0, r0, r1 - r0)?.matmul(&z.narrow(1, 0, r1)?)?;
+        // Placed straight from the product's own buffer: copying it out
+        // first (to_vec1) made every panel twice.
+        crate::host::with_values(&block, |block: &[f64]| {
+            for (row, src) in gram[r0 * d..r1 * d]
+                .chunks_exact_mut(d)
+                .zip(block.chunks_exact(r1))
+            {
+                row[..r1].copy_from_slice(src);
+            }
+        })?;
         r0 = r1;
     }
     Ok(gram)

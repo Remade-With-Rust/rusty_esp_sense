@@ -4,25 +4,37 @@
 //! values in one buffer, and a pass that only READS them (statistics, or a
 //! transform writing somewhere else) can borrow that buffer instead.
 
-use candle_core::{DType, Storage, Tensor};
+use candle_core::{Storage, Tensor, WithDType};
 
-/// Call `f` with `t`'s values, row-major: borrowed when `t` is a contiguous
-/// CPU `f32` tensor, from a copy otherwise.
+/// Call `f` with `t`'s values as `D`, row-major: borrowed when `t` is a
+/// contiguous CPU tensor of that type, from a copy otherwise.
+///
+/// # Errors
+///
+/// A tensor error from the fallback copy.
+pub(crate) fn with_values<D: WithDType, T>(
+    t: &Tensor,
+    f: impl FnOnce(&[D]) -> T,
+) -> crate::Result<T> {
+    if t.dtype() == D::DTYPE {
+        let (storage, layout) = t.storage_and_layout();
+        if let (Storage::Cpu(cpu), Some((start, end))) = (&*storage, layout.contiguous_offsets()) {
+            if let Some(values) = cpu.as_slice::<D>().ok().and_then(|v| v.get(start..end)) {
+                return Ok(f(values));
+            }
+        }
+    }
+    let v: Vec<D> = t.to_dtype(D::DTYPE)?.flatten_all()?.to_vec1()?;
+    Ok(f(&v))
+}
+
+/// [`with_values`] for `f32`.
 ///
 /// # Errors
 ///
 /// A tensor error from the fallback copy.
 pub(crate) fn with_f32<T>(t: &Tensor, f: impl FnOnce(&[f32]) -> T) -> crate::Result<T> {
-    if t.dtype() == DType::F32 {
-        let (storage, layout) = t.storage_and_layout();
-        if let (Storage::Cpu(cpu), Some((start, end))) = (&*storage, layout.contiguous_offsets()) {
-            if let Some(values) = cpu.as_slice::<f32>().ok().and_then(|v| v.get(start..end)) {
-                return Ok(f(values));
-            }
-        }
-    }
-    let v: Vec<f32> = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-    Ok(f(&v))
+    with_values(t, f)
 }
 
 #[cfg(test)]
