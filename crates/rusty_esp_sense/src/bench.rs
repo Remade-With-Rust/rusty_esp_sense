@@ -152,15 +152,32 @@ pub fn load(root: &Path) -> crate::Result<Vec<Recording>> {
             found.push((path, scenario, day));
         }
     }
+    // One read buffer per thread, reused file after file: the bytes are
+    // only parsed, and a fresh 1.2 MB buffer per file cost its first-touch
+    // page faults every time. The files are split into one contiguous run
+    // per pool thread (map_init made a buffer per work-stealing split, 27
+    // at one thread), each run parsed in order, the runs joined in order.
+    let per = found
+        .len()
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(1);
     let parsed: Vec<crate::Result<Recording>> = found
-        .into_par_iter()
-        .map(|(path, scenario, day)| {
-            Ok(Recording {
-                scenario,
-                day,
-                capture: capture::read(&path, TAG_C6_HT20_NATURAL, FRAME_US)?,
-            })
+        .par_chunks_mut(per)
+        .map(|run| {
+            let mut buf = Vec::new();
+            run.iter_mut()
+                .map(|(path, scenario, day)| {
+                    Ok(Recording {
+                        scenario: *scenario,
+                        day: core::mem::take(day),
+                        capture: capture::read_into(path, &mut buf, TAG_C6_HT20_NATURAL, FRAME_US)?,
+                    })
+                })
+                .collect::<Vec<_>>()
         })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
         .collect();
     let mut out = Vec::with_capacity(parsed.len());
     for r in parsed {

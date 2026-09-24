@@ -113,15 +113,41 @@ pub fn parse_bytes(name: &str, bytes: &[u8], layout: u8, frame_us: u64) -> crate
 ///
 /// [`crate::Error::Io`] when the file cannot be read or is not UTF-8.
 pub fn read(path: &std::path::Path, layout: u8, frame_us: u64) -> crate::Result<Capture> {
-    let bytes = {
+    read_into(path, &mut Vec::new(), layout, frame_us)
+}
+
+/// [`read`] through the caller's buffer: the file's bytes are read into
+/// `buf` (cleared first, grown to the file's size as `fs::read` sizes its
+/// own) and parsed from there. A caller reading many files keeps one buffer
+/// -- the bytes are only parsed, never kept -- instead of a fresh
+/// megabyte-scale allocation per file, each of whose pages faults in on
+/// first touch.
+///
+/// # Errors
+///
+/// As [`read`].
+pub fn read_into(
+    path: &std::path::Path,
+    buf: &mut Vec<u8>,
+    layout: u8,
+    frame_us: u64,
+) -> crate::Result<Capture> {
+    {
+        use std::io::Read;
         let _g = prof::scope(Stage::Parse);
-        std::fs::read(path)?
-    };
+        buf.clear();
+        let mut f = std::fs::File::open(path)?;
+        let hint = f
+            .metadata()
+            .map_or(0, |m| usize::try_from(m.len()).unwrap_or(0));
+        buf.reserve_exact(hint);
+        f.read_to_end(buf)?;
+    }
     let name = path.file_name().map_or_else(
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
-    parse_bytes(&name, &bytes, layout, frame_us)
+    parse_bytes(&name, buf, layout, frame_us)
 }
 
 /// What `char::is_whitespace` (and so `str::trim`) calls whitespace, within

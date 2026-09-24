@@ -320,8 +320,8 @@ fn fit(args: &mut Args) -> Result<(), String> {
     // the training set then borrows their rows.
     let read: Vec<Result<(usize, window::FlatWindows), String>> = jobs
         .par_iter()
-        .map(|&(_, _, f)| {
-            let c = capture::read(&PathBuf::from(f), layout, bench::FRAME_US)
+        .map_init(Vec::new, |buf, &(_, _, f)| {
+            let c = capture::read_into(&PathBuf::from(f), buf, layout, bench::FRAME_US)
                 .map_err(|e| format!("{f}: {e}"))?;
             Ok((c.rejected, window::windows_flat(&c.samples, win)))
         })
