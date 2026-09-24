@@ -145,17 +145,33 @@ pub fn run(recordings: &[Recording], burst: Option<u16>) -> FallReport {
     } else {
         0
     };
-    let mut b = config.burst_permille.saturating_sub(1);
-    while first_false_at == 0 && b > config.active_permille {
-        let c = FallConfig {
-            burst_permille: b,
-            ..config
-        };
-        if test.iter().any(|(_, st)| events(st, c) > 0) {
-            first_false_at = b;
-            break;
+    // The burst threshold enters the detector in ONE comparison,
+    // `wander >= burst`, so between two wander values that occur in the test
+    // streams every threshold behaves identically: a threshold `b` acts like
+    // the smallest occurring value at or above it. Walking every integer
+    // down from the default re-ran identical passes; walking the distinct
+    // occurring values below it (each the top of its interval, which is
+    // what the integer walk would have returned) cannot give a different
+    // answer. The one threshold that is not an occurring value, the
+    // default, was evaluated above.
+    if first_false_at == 0 {
+        let mut values: Vec<u16> = test
+            .iter()
+            .flat_map(|(_, st)| st.iter().map(|&(_, w)| w))
+            .filter(|&w| w < config.burst_permille && w > config.active_permille)
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+        for &b in values.iter().rev() {
+            let c = FallConfig {
+                burst_permille: b,
+                ..config
+            };
+            if test.iter().any(|(_, st)| events(st, c) > 0) {
+                first_false_at = b;
+                break;
+            }
         }
-        b -= 1;
     }
     // Splices: each test walking capture's MOST ACTIVE 10 s of wander, then
     // (or not) a half-second burst above the threshold, then 20 s of a test
@@ -229,6 +245,62 @@ mod tests {
             }
         }
         out
+    }
+
+    /// R5's oracle: over streams built to put wander values between and on
+    /// the candidate thresholds, the distinct-value walk and the integer walk
+    /// find the same highest alarming threshold.
+    #[test]
+    fn walking_distinct_values_finds_what_walking_every_integer_finds() {
+        let integer_walk = |test: &[Stream], config: FallConfig| -> u16 {
+            let mut b = config.burst_permille;
+            while b > config.active_permille {
+                let c = FallConfig {
+                    burst_permille: b,
+                    ..config
+                };
+                if test.iter().any(|st| events(st, c) > 0) {
+                    return b;
+                }
+                b -= 1;
+            }
+            0
+        };
+        let distinct_walk = |test: &[Stream], config: FallConfig| -> u16 {
+            if test.iter().any(|st| events(st, config) > 0) {
+                return config.burst_permille;
+            }
+            let mut v: Vec<u16> = test
+                .iter()
+                .flat_map(|st| st.iter().map(|&(_, w)| w))
+                .filter(|&w| w < config.burst_permille && w > config.active_permille)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            for &b in v.iter().rev() {
+                let c = FallConfig {
+                    burst_permille: b,
+                    ..config
+                };
+                if test.iter().any(|st| events(st, c) > 0) {
+                    return b;
+                }
+            }
+            0
+        };
+        for peak in [40u16, 90, 150, 200, 231, 232, 300] {
+            let test = vec![
+                stream(&[(5, 60), (1, peak), (15, 18)]),
+                stream(&[(3, 45), (1, peak / 2 + 20), (12, 25)]),
+                stream(&[(20, 17)]),
+            ];
+            let c = FallConfig::normalised_default();
+            assert_eq!(
+                integer_walk(&test, c),
+                distinct_walk(&test, c),
+                "peak {peak}"
+            );
+        }
     }
 
     #[test]
