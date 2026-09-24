@@ -39,6 +39,7 @@ pub mod bench;
 pub mod capture;
 pub mod encoder;
 pub mod fall_bench;
+mod host;
 pub mod metrics;
 pub mod model;
 pub mod prof;

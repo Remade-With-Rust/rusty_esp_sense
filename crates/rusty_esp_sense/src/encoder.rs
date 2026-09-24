@@ -92,21 +92,25 @@ impl RandomFeatures {
         let y = x.matmul(&self.w.t()?)?;
         let (n, width) = y.dims2()?;
         let b: Vec<f32> = self.b.to_vec1()?;
-        let mut v: Vec<f32> = y.flatten_all()?.to_vec1()?;
-        for row in v.chunks_exact_mut(width) {
-            bias_relu(row, &b);
-        }
+        // Read the product where the multiply left it and write each value
+        // once, biased and rectified: a copy out and a second pass over the
+        // copy did the same.
+        let v = crate::host::with_f32(&y, |y| {
+            let mut v = Vec::with_capacity(y.len());
+            for row in y.chunks_exact(width.max(1)) {
+                extend_bias_relu(&mut v, row, &b);
+            }
+            v
+        })?;
         Ok(Tensor::from_vec(v, (n, width), &Device::Cpu)?)
     }
 }
 
-/// `row[j] = max(row[j] + b[j], 0)`, per element. Its own frame so the two
+/// Append `max(row[j] + b[j], 0)` for each `j`. Its own frame so the
 /// slices arrive as non-aliasing parameters and the loop is packed.
 #[inline(never)]
-fn bias_relu(row: &mut [f32], b: &[f32]) {
-    for (e, &bias) in row.iter_mut().zip(b) {
-        *e = (*e + bias).max(0.0);
-    }
+fn extend_bias_relu(out: &mut Vec<f32>, row: &[f32], b: &[f32]) {
+    out.extend(row.iter().zip(b).map(|(&e, &bias)| (e + bias).max(0.0)));
 }
 
 #[cfg(test)]
