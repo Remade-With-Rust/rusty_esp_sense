@@ -29,10 +29,32 @@ impl Standardize {
     /// A tensor error when `x` is not two-dimensional.
     pub fn fit(x: &Tensor) -> crate::Result<Self> {
         let _g = prof::scope(Stage::InputStd);
+        let (_, d) = x.dims2()?;
+        let v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        Ok(Self::of(&v, d))
+    }
+
+    /// [`Standardize::fit`] and then [`Standardize::apply`] to the same
+    /// `x`: the input copied out once, and standardised in place while the
+    /// copy is fresh, where the two calls copied it out twice.
+    ///
+    /// # Errors
+    ///
+    /// A tensor error when `x` is not two-dimensional.
+    pub fn fit_apply(x: &Tensor) -> crate::Result<(Self, Tensor)> {
+        let _g = prof::scope(Stage::InputStd);
+        let (n, d) = x.dims2()?;
+        let mut v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let norm = Self::of(&v, d);
+        norm.apply_in_place(&mut v);
+        Ok((norm, Tensor::from_vec(v, (n, d), &Device::Cpu)?))
+    }
+
+    /// The statistics of `v`, `d` columns row-major.
+    fn of(v: &[f32], d: usize) -> Self {
         // Column sums in f64, row by row, streamed from the f32 values: no
         // f64 copy of the input, no deviations tensor, no squares tensor.
-        let (n, d) = x.dims2()?;
-        let v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
+        let n = v.len() / d.max(1);
         let nf = n as f64;
         let mut mean = vec![0f64; d];
         for row in v.chunks_exact(d) {
@@ -48,13 +70,13 @@ impl Standardize {
         for s in &mut var {
             *s /= nf;
         }
-        Ok(Standardize {
+        Standardize {
             mean: mean.iter().map(|&m| m as f32).collect(),
             std: var
                 .iter()
                 .map(|&v| if v > 1e-12 { v.sqrt() as f32 } else { 1.0 })
                 .collect(),
-        })
+        }
     }
 
     /// `(x - mean) / std`, for an `[n, d]` tensor.
@@ -77,12 +99,17 @@ impl Standardize {
             )));
         }
         let mut v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-        for row in v.chunks_exact_mut(d) {
+        self.apply_in_place(&mut v);
+        Ok(Tensor::from_vec(v, (n, d), &Device::Cpu)?)
+    }
+
+    /// `(e - mean) / std` over `v`, row-major at this width.
+    fn apply_in_place(&self, v: &mut [f32]) {
+        for row in v.chunks_exact_mut(self.mean.len().max(1)) {
             for ((e, &m), &s) in row.iter_mut().zip(&self.mean).zip(&self.std) {
                 *e = (*e - m) / s;
             }
         }
-        Ok(Tensor::from_vec(v, (n, d), &Device::Cpu)?)
     }
 }
 
@@ -135,8 +162,10 @@ impl Ridge {
                 y.len()
             )));
         }
-        let norm = Standardize::fit(phi)?;
-        let z = norm.apply(phi)?.to_dtype(DType::F64)?;
+        let (norm, z32) = Standardize::fit_apply(phi)?;
+        let z = z32.to_dtype(DType::F64)?;
+        // A shadowing `let` would keep the f32 copy alive through the fit.
+        drop(z32);
         let intercept: Vec<f64> = (0..outputs)
             .map(|j| (0..n).map(|i| f64::from(y[i * outputs + j])).sum::<f64>() / n as f64)
             .collect();

@@ -135,8 +135,6 @@ impl Model {
             return Err(crate::Error::Input(format!("target {t} with {k} labels")));
         }
         let width = window.width(subcarriers);
-        let x = stack(data, width)?;
-        let input = Standardize::fit(&x)?;
         let encoder = match encoder {
             _ if cfg.features == 0 => None,
             Some(e) if e.seed == cfg.seed && e.input == width && e.output == cfg.features => {
@@ -144,7 +142,16 @@ impl Model {
             }
             _ => Some(RandomFeatures::new(cfg.seed, width, cfg.features)?),
         };
-        let phi = Self::encode_with(&input, encoder.as_ref(), &x)?;
+        // The stacked and standardised inputs live only until encoded, not
+        // through the readout's fit.
+        let (input, phi) = {
+            let (input, z) = Standardize::fit_apply(&stack(data, width)?)?;
+            let phi = match &encoder {
+                Some(e) => e.encode(&z)?,
+                None => z,
+            };
+            (input, phi)
+        };
         let y: Vec<f32> = targets
             .iter()
             .flat_map(|&t| (0..k).map(move |j| if j == t { 1.0 } else { -1.0 }))
