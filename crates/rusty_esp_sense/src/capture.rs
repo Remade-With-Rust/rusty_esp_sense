@@ -9,6 +9,7 @@
 //! the frame is stamped at the rate the recording was made at. Anything
 //! else after the I/Q refuses the row.
 
+use crate::prof::{self, Counter, Stage};
 use rusty_esp_signal_core::esp_core::Micros;
 use rusty_esp_signal_core::radar::csi_stream::{MAX_IQ, Sample};
 
@@ -29,6 +30,7 @@ pub struct Capture {
 /// frames at (20 000 for 50 Hz).
 #[must_use]
 pub fn parse(name: &str, text: &str, layout: u8, frame_us: u64) -> Capture {
+    let _g = prof::scope(Stage::Parse);
     let mut samples = Vec::with_capacity(text.len() / 400);
     let mut rejected = 0usize;
     for line in text.lines() {
@@ -50,6 +52,7 @@ pub fn parse(name: &str, text: &str, layout: u8, frame_us: u64) -> Capture {
             None => rejected += 1,
         }
     }
+    prof::add(Counter::Rows, (samples.len() + rejected) as u64);
     Capture {
         name: name.to_owned(),
         samples,
@@ -63,7 +66,10 @@ pub fn parse(name: &str, text: &str, layout: u8, frame_us: u64) -> Capture {
 ///
 /// [`crate::Error::Io`] when the file cannot be read.
 pub fn read(path: &std::path::Path, layout: u8, frame_us: u64) -> crate::Result<Capture> {
-    let text = std::fs::read_to_string(path)?;
+    let text = {
+        let _g = prof::scope(Stage::Parse);
+        std::fs::read_to_string(path)?
+    };
     let name = path.file_name().map_or_else(
         || path.display().to_string(),
         |n| n.to_string_lossy().into_owned(),

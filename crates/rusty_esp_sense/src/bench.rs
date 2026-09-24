@@ -38,6 +38,7 @@ use rusty_esp_signal_core::radar::csi_stream::TAG_C6_HT20_NATURAL;
 
 use crate::capture::{self, Capture};
 use crate::model::{FitConfig, Model};
+use crate::prof::{self, Counter, Stage};
 use crate::window::{self, WindowConfig};
 
 /// The dataset's frame interval: 50 Hz.
@@ -263,6 +264,8 @@ struct Prepared {
 }
 
 fn detector_calls(c: &Capture, frames: usize) -> Vec<bool> {
+    let _g = prof::scope(Stage::Detector);
+    prof::add(Counter::DetectorPushes, c.samples.len() as u64);
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
     let mut calls = Vec::new();
     let mut seen = 0usize;
@@ -305,14 +308,17 @@ fn called_occupied(model: &Model, windows: &[Vec<f32>]) -> crate::Result<Vec<boo
 }
 
 fn fit_on(prepared: &[&Prepared], subcarriers: usize, cfg: &BenchConfig) -> crate::Result<Model> {
+    let gather = prof::scope(Stage::Gather);
     let mut data = Vec::new();
     let mut targets = Vec::new();
     for p in prepared {
         for w in &p.windows {
+            prof::add(Counter::WindowCloneBytes, (w.len() * 4) as u64);
             data.push(w.clone());
             targets.push(usize::from(p.scenario.occupied()));
         }
     }
+    drop(gather);
     Model::fit(
         &data,
         &targets,

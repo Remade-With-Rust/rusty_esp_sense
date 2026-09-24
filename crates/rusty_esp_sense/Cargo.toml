@@ -21,6 +21,9 @@ default = []
 # W5 CSI stream over iroh and read the room live. Off by default so the
 # offline build carries no network stack.
 live = ["dep:rusty_esp_iroh-host", "dep:tokio"]
+# The stage profiler, the work counters and (in the binary) the allocation
+# census. Development only; off, every scope and counter compiles to nothing.
+profile = []
 
 [dependencies]
 rusty_esp_signal-core = { workspace = true, features = ["std"] }

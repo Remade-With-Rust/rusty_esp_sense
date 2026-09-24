@@ -21,6 +21,7 @@ use rusty_esp_signal_core::radar::csi::{Config as DetectorConfig, PresenceDetect
 use rusty_esp_signal_core::radar::fall::{FallConfig, FallDetector};
 
 use crate::bench::{Recording, Scenario};
+use crate::prof::{self, Counter, Stage};
 
 /// One capture's wander stream: `(at, permille)` per frame.
 pub type Stream = Vec<(Micros, u16)>;
@@ -28,6 +29,8 @@ pub type Stream = Vec<(Micros, u16)>;
 /// The on-chip detector's wander, frame by frame.
 #[must_use]
 pub fn wander_stream(r: &Recording) -> Stream {
+    let _g = prof::scope(Stage::Detector);
+    prof::add(Counter::DetectorPushes, r.capture.samples.len() as u64);
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
     let mut out = Vec::with_capacity(r.capture.samples.len());
     for s in &r.capture.samples {
@@ -44,6 +47,8 @@ pub fn wander_stream(r: &Recording) -> Stream {
 /// Events a detector with `config` raises over `stream`.
 #[must_use]
 pub fn events(stream: &Stream, config: FallConfig) -> usize {
+    let _g = prof::scope(Stage::Fall);
+    prof::add(Counter::FallPushes, stream.len() as u64);
     let mut d = FallDetector::new(config);
     stream
         .iter()

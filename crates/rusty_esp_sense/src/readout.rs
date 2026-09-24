@@ -10,6 +10,8 @@
 
 use candle_core::{DType, Device, Tensor};
 
+use crate::prof::{self, Counter, Stage};
+
 /// Per-column mean and standard deviation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Standardize {
@@ -26,6 +28,7 @@ impl Standardize {
     ///
     /// A tensor error when `x` is not two-dimensional.
     pub fn fit(x: &Tensor) -> crate::Result<Self> {
+        let _g = prof::scope(Stage::InputStd);
         let x = x.to_dtype(DType::F64)?;
         let n = x.dim(0)? as f64;
         let mean = (x.sum(0)? / n)?;
@@ -47,6 +50,8 @@ impl Standardize {
     ///
     /// A tensor error when `x`'s width is not this one's.
     pub fn apply(&self, x: &Tensor) -> crate::Result<Tensor> {
+        let _g = prof::scope(Stage::InputStd);
+        prof::add(Counter::TensorBuilds, 2);
         let d = self.mean.len();
         let mean = Tensor::from_slice(&self.mean, d, &Device::Cpu)?;
         let std = Tensor::from_slice(&self.std, d, &Device::Cpu)?;
@@ -92,9 +97,14 @@ impl Ridge {
             .map(|k| f64::from(y[k]) - intercept[k % outputs])
             .collect();
         let yc = Tensor::from_vec(yc, (n, outputs), &Device::Cpu)?;
-        let zt = z.t()?.contiguous()?;
-        let mut gram: Vec<f64> = zt.matmul(&z)?.flatten_all()?.to_vec1()?;
-        let rhs: Vec<f64> = zt.matmul(&yc)?.flatten_all()?.to_vec1()?;
+        let (mut gram, rhs) = {
+            let _g = prof::scope(Stage::Gram);
+            prof::add(Counter::GramMacs, (n * d * d + n * d * outputs) as u64);
+            let zt = z.t()?.contiguous()?;
+            let gram: Vec<f64> = zt.matmul(&z)?.flatten_all()?.to_vec1()?;
+            let rhs: Vec<f64> = zt.matmul(&yc)?.flatten_all()?.to_vec1()?;
+            (gram, rhs)
+        };
         let lambda = alpha * n as f64;
         for i in 0..d {
             gram[i * d + i] += lambda;
@@ -115,14 +125,13 @@ impl Ridge {
     ///
     /// A tensor error when `phi`'s width is not the fitted one.
     pub fn predict(&self, phi: &Tensor) -> crate::Result<Tensor> {
+        let z = self.norm.apply(&phi.to_dtype(DType::F32)?)?;
+        let _g = prof::scope(Stage::Predict);
+        prof::add(Counter::TensorBuilds, 2);
         let d = self.norm.mean.len();
         let beta = Tensor::from_slice(&self.beta, (d, self.outputs), &Device::Cpu)?;
         let icpt = Tensor::from_slice(&self.intercept, self.outputs, &Device::Cpu)?;
-        Ok(self
-            .norm
-            .apply(&phi.to_dtype(DType::F32)?)?
-            .matmul(&beta)?
-            .broadcast_add(&icpt)?)
+        Ok(z.matmul(&beta)?.broadcast_add(&icpt)?)
     }
 }
 
@@ -130,6 +139,14 @@ impl Ridge {
 /// overwritten with its Cholesky factor) and `B` (`d × k`). `None` when `A`
 /// is not positive definite.
 fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f64>> {
+    let _g = prof::scope(Stage::Cholesky);
+    // Inner-loop multiply-adds, exactly: the factor's plus two triangular
+    // solves per right-hand side.
+    let factor: u64 = (0..d as u64).map(|j| j + (d as u64 - j - 1) * j).sum();
+    prof::add(
+        Counter::CholeskyMacs,
+        factor + (k as u64) * (d as u64) * (d as u64).saturating_sub(1),
+    );
     // A = L Lᵀ, L in the lower triangle.
     for j in 0..d {
         let mut s = a[j * d + j];
@@ -174,6 +191,48 @@ fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cache sweep (codec-analyzer #3): nanoseconds per multiply-add of
+    /// the solve as the factor outgrows L1, L2 and L3. Flat means compute;
+    /// climbing means memory. Timing, so best-of-N; not a gate.
+    #[test]
+    #[ignore = "probe: run with --ignored --nocapture, release"]
+    fn probe_cholesky_cache_sweep() {
+        for d in [64usize, 128, 256, 512, 768, 1024, 1536, 2048] {
+            // A = M Mᵀ/d + I, symmetric positive definite, deterministic.
+            let m: Vec<f64> = (0..d * d)
+                .map(|i| ((i * 2_654_435_761) % 1000) as f64 / 1000.0 - 0.5)
+                .collect();
+            let mut a0 = vec![0.0; d * d];
+            for i in 0..d {
+                for j in 0..=i {
+                    let s: f64 =
+                        (0..d).map(|p| m[i * d + p] * m[j * d + p]).sum::<f64>() / d as f64;
+                    a0[i * d + j] = s;
+                    a0[j * d + i] = s;
+                }
+                a0[i * d + i] += 1.0;
+            }
+            let b: Vec<f64> = (0..2 * d).map(|i| (i % 7) as f64).collect();
+            let macs: f64 = (0..d).map(|j| (j + (d - j - 1) * j) as f64).sum::<f64>()
+                + 2.0 * (d * (d - 1)) as f64;
+            let mut best = f64::MAX;
+            let reps = if d <= 512 { 7 } else { 3 };
+            for _ in 0..reps {
+                let mut a = a0.clone();
+                let t = std::time::Instant::now();
+                let x = cholesky_solve(&mut a, d, &b, 2).unwrap();
+                let ns = t.elapsed().as_nanos() as f64;
+                std::hint::black_box(x);
+                best = best.min(ns);
+            }
+            println!(
+                "probe d={d:5} working set {:>8} KiB  {:.3} ns/MAC",
+                d * d * 8 / 1024,
+                best / macs
+            );
+        }
+    }
 
     #[test]
     fn cholesky_solves_a_known_system() {

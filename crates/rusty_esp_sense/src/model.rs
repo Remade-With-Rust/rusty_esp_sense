@@ -13,6 +13,7 @@ use std::path::Path;
 use candle_core::{DType, Device, Tensor};
 
 use crate::encoder::RandomFeatures;
+use crate::prof::{self, Counter, Stage};
 use crate::readout::{Ridge, Standardize};
 use crate::window::WindowConfig;
 
@@ -67,6 +68,9 @@ pub struct Model {
 }
 
 fn stack(data: &[Vec<f32>], width: usize) -> crate::Result<Tensor> {
+    let _g = prof::scope(Stage::Stack);
+    prof::add(Counter::StackBytes, (data.len() * width * 4) as u64);
+    prof::add(Counter::TensorBuilds, 1);
     if data.iter().any(|w| w.len() != width) {
         return Err(crate::Error::Input(format!(
             "a window is not {width} values wide"
@@ -150,7 +154,9 @@ impl Model {
         }
         let x = stack(data, self.window.width(self.subcarriers))?;
         let phi = Self::encode_with(&self.input, self.encoder.as_ref(), &x)?;
-        Ok(self.ridge.predict(&phi)?.to_vec2()?)
+        let y = self.ridge.predict(&phi)?;
+        let _g = prof::scope(Stage::Predict);
+        Ok(y.to_vec2()?)
     }
 
     /// The label index each window reads as.
@@ -159,8 +165,9 @@ impl Model {
     ///
     /// As [`Model::scores`].
     pub fn classify(&self, data: &[Vec<f32>]) -> crate::Result<Vec<usize>> {
-        Ok(self
-            .scores(data)?
+        let scores = self.scores(data)?;
+        let _g = prof::scope(Stage::Classify);
+        Ok(scores
             .iter()
             .map(|s| {
                 s.iter()
@@ -180,6 +187,7 @@ impl Model {
     ///
     /// A tensor or I/O error.
     pub fn save(&self, path: &Path) -> crate::Result<()> {
+        let _g = prof::scope(Stage::Io);
         let dev = Device::Cpu;
         let (features, seed) = self.encoder.as_ref().map_or((0, 0), |e| (e.output, e.seed));
         let meta: Vec<i64> = vec![
@@ -223,7 +231,10 @@ impl Model {
     /// [`crate::Error::Model`] for a file that is not one of ours or a
     /// format version this build does not know; a tensor error otherwise.
     pub fn load(path: &Path) -> crate::Result<Self> {
-        let t = candle_core::safetensors::load(path, &Device::Cpu)?;
+        let t = {
+            let _g = prof::scope(Stage::Io);
+            candle_core::safetensors::load(path, &Device::Cpu)?
+        };
         let get = |k: &str| {
             t.get(k)
                 .ok_or_else(|| crate::Error::Model(format!("no `{k}` in {}", path.display())))

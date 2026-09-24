@@ -20,6 +20,7 @@
 //! instead -- presence is second-order, a body makes the channel MOVE, and
 //! a linear readout of centred amplitudes averages that motion away.
 
+use crate::prof::{self, Counter, Stage};
 use rusty_esp_signal_core::radar::csi_stream::Sample;
 
 /// How to cut windows.
@@ -82,6 +83,7 @@ pub struct Windows {
 /// dropped.
 #[must_use]
 pub fn windows(samples: &[Sample], cfg: WindowConfig) -> Windows {
+    let _g = prof::scope(Stage::Window);
     let t = cfg.frames.max(1);
     let mut out = Windows::default();
     let mut frames: Vec<Vec<f32>> = Vec::with_capacity(t);
@@ -101,7 +103,10 @@ pub fn windows(samples: &[Sample], cfg: WindowConfig) -> Windows {
         }
         // `normalised` scales so the frame's mean is 1024.
         frames.push(amps.iter().map(|&a| f32::from(a) / 1024.0).collect());
+        prof::add(Counter::FrameVecs, 1);
+        prof::add(Counter::FramesWindowed, 1);
         if frames.len() == t {
+            prof::add(Counter::Windows, 1);
             out.data.push(if cfg.wander {
                 wander(&frames, out.subcarriers)
             } else {

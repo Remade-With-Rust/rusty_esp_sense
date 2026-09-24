@@ -27,6 +27,7 @@
 //! Stages. REM, light and deep sleep need polysomnography to label and to
 //! validate; there is none, so there are none.
 
+use crate::prof::{self, Counter, Stage};
 use rusty_esp_signal_core::esp_core::Micros;
 use rusty_esp_signal_core::radar::csi::{Config as DetectorConfig, PresenceDetector};
 use rusty_esp_signal_core::radar::csi_stream::Sample;
@@ -111,6 +112,9 @@ impl State {
 /// Measure a recording's epochs.
 #[must_use]
 pub fn epochs(samples: &[Sample], cfg: &NightConfig) -> Vec<Epoch> {
+    let _g = prof::scope(Stage::Night);
+    prof::add(Counter::DetectorPushes, samples.len() as u64);
+    prof::add(Counter::VitalsPushes, samples.len() as u64);
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
     let mut vit: Box<VitalsEstimator<200>> =
         Box::new(VitalsEstimator::new(VitalsConfig::breathing(cfg.frame_hz)));
@@ -174,6 +178,7 @@ fn close(
 /// an empty room through to "asleep", because they asked the motion alone.
 #[must_use]
 pub fn score(epochs: &[Epoch], cfg: &NightConfig) -> Vec<State> {
+    let _g = prof::scope(Stage::Night);
     let n = epochs.len();
     (0..n)
         .map(|t| {

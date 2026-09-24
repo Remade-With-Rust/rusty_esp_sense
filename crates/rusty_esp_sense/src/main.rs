@@ -95,7 +95,65 @@ impl Args {
     }
 }
 
+/// The allocation census (`--features profile`): a counting wrapper around
+/// the system allocator, in the binary only -- a library never declares an
+/// allocator. Dev-only, so the one `unsafe` it needs is gated with it.
+#[cfg(feature = "profile")]
+mod census {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::alloc::{GlobalAlloc, Layout, System};
+
+    pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static LIVE: AtomicU64 = AtomicU64::new(0);
+    pub static PEAK: AtomicU64 = AtomicU64::new(0);
+
+    pub struct Counting;
+
+    // SAFETY: every call forwards to `System` with the caller's own layout
+    // and pointer, unchanged; the counters are atomics and never touch the
+    // memory handed out.
+    #[allow(unsafe_code)]
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(l.size() as u64, Relaxed);
+            let live = LIVE.fetch_add(l.size() as u64, Relaxed) + l.size() as u64;
+            PEAK.fetch_max(live, Relaxed);
+            // SAFETY: the caller's contract, passed through.
+            unsafe { System.alloc(l) }
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            LIVE.fetch_sub(l.size() as u64, Relaxed);
+            // SAFETY: the caller's contract, passed through.
+            unsafe { System.dealloc(p, l) }
+        }
+    }
+
+    #[global_allocator]
+    static A: Counting = Counting;
+
+    pub fn report() -> String {
+        format!(
+            "allocations {} bytes {} peak-live {}\n",
+            ALLOCS.load(Relaxed),
+            BYTES.load(Relaxed),
+            PEAK.load(Relaxed)
+        )
+    }
+}
+
 fn main() -> ExitCode {
+    let code = {
+        let _g = rusty_esp_sense::prof::scope(rusty_esp_sense::prof::Stage::Total);
+        real_main()
+    };
+    #[cfg(feature = "profile")]
+    eprint!("{}{}", rusty_esp_sense::prof::dump(), census::report());
+    code
+}
+
+fn real_main() -> ExitCode {
     let mut all: Vec<String> = std::env::args().skip(1).collect();
     if all.is_empty() {
         eprintln!("{USAGE}");
@@ -490,6 +548,10 @@ fn bench_night(args: &mut Args) -> Result<(), String> {
         for r in recs.iter().filter(|r| r.scenario == s) {
             let base = r.capture.samples.first().map_or(0, |x| x.at.0);
             let mut end = offset;
+            rusty_esp_sense::prof::add(
+                rusty_esp_sense::prof::Counter::SampleCopies,
+                r.capture.samples.len() as u64,
+            );
             for x in &r.capture.samples {
                 let mut y = *x;
                 y.at = Micros(offset + (x.at.0 - base));

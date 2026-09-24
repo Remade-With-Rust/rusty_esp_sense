@@ -41,6 +41,7 @@ pub mod encoder;
 pub mod fall_bench;
 pub mod metrics;
 pub mod model;
+pub mod prof;
 pub mod readout;
 pub mod sleep;
 pub mod window;

@@ -11,6 +11,8 @@
 
 use candle_core::{Device, Tensor};
 
+use crate::prof::{self, Counter, Stage};
+
 /// `splitmix64`: small, fast, and fixed by its definition.
 #[derive(Debug, Clone)]
 struct SplitMix64(u64);
@@ -56,6 +58,8 @@ impl RandomFeatures {
     ///
     /// A tensor error (only on allocation failure).
     pub fn new(seed: u64, input: usize, output: usize) -> crate::Result<Self> {
+        let _g = prof::scope(Stage::EncoderGen);
+        prof::add(Counter::RandomValues, (input * output + output) as u64);
         let mut g = SplitMix64(seed);
         let scale = 1.0 / (input.max(1) as f64).sqrt();
         let w: Vec<f32> = (0..input * output)
@@ -77,6 +81,11 @@ impl RandomFeatures {
     ///
     /// A tensor error when `x` is not `[n, input]`.
     pub fn encode(&self, x: &Tensor) -> crate::Result<Tensor> {
+        let _g = prof::scope(Stage::Encode);
+        prof::add(
+            Counter::EncodeMacs,
+            (x.dim(0)? * self.input * self.output) as u64,
+        );
         Ok(x.matmul(&self.w.t()?)?.broadcast_add(&self.b)?.relu()?)
     }
 }
