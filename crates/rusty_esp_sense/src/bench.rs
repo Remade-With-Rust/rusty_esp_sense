@@ -40,6 +40,7 @@ use crate::capture::{self, Capture};
 use crate::encoder::RandomFeatures;
 use crate::model::{FitConfig, Model};
 use crate::prof::{self, Counter, Stage};
+use crate::readout::{Ridge, Standardize};
 use crate::window::{self, WindowConfig};
 
 /// The dataset's frame interval: 50 Hz.
@@ -339,6 +340,37 @@ fn fit_on(
     )
 }
 
+/// A zero-valued model with exactly the shapes a fit with `cfg` produces.
+fn shaped_like(subcarriers: usize, cfg: &BenchConfig, encoder: Option<&RandomFeatures>) -> Model {
+    let width = cfg.window.width(subcarriers);
+    let d = if cfg.fit.features > 0 {
+        cfg.fit.features
+    } else {
+        width
+    };
+    let outputs = 2;
+    let zeros = |n: usize| vec![0f32; n];
+    Model {
+        window: cfg.window,
+        subcarriers,
+        input: Standardize {
+            mean: zeros(width),
+            std: zeros(width),
+        },
+        encoder: encoder.cloned(),
+        ridge: Ridge {
+            norm: Standardize {
+                mean: zeros(d),
+                std: zeros(d),
+            },
+            beta: zeros(d * outputs),
+            intercept: zeros(outputs),
+            outputs,
+        },
+        labels: vec!["empty".into(), "occupied".into()],
+    }
+}
+
 /// Run the benchmark over `recordings`.
 ///
 /// # Errors
@@ -421,9 +453,11 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
         }
     }
 
-    // A model calibrated on everything: its file's size.
-    let all: Vec<&Prepared> = prepared.iter().collect();
-    let model = fit_on(&all, subcarriers, cfg, encoder.as_ref())?;
+    // The size of a model file calibrated on everything. A safetensors file's
+    // size is a function of its tensors' SHAPES (the header holds shapes and
+    // offsets), never their values, so a zero-valued model of the same shape
+    // measures it without an eighth fit's Gram matrix and Cholesky solve.
+    let model = shaped_like(subcarriers, cfg, encoder.as_ref());
     let path = std::env::temp_dir().join(format!(
         "rusty_esp_sense-bench-{}.safetensors",
         std::process::id()
@@ -464,6 +498,60 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The oracle for R2: a model fitted on data and the zero-valued one of
+    /// the same shape save to files of identical size, raw window or wander,
+    /// with or without the encoder.
+    #[test]
+    fn a_fitted_model_and_its_shape_save_to_the_same_size() {
+        for (wander, features) in [(true, 64), (true, 0), (false, 32)] {
+            let window = WindowConfig {
+                frames: 10,
+                centre: true,
+                wander,
+            };
+            let cfg = BenchConfig {
+                window,
+                fit: FitConfig {
+                    features,
+                    ..FitConfig::DEFAULT
+                },
+                folds: 5,
+            };
+            let s = 6;
+            let w = window.width(s);
+            let data: Vec<Vec<f32>> = (0..20)
+                .map(|i| {
+                    (0..w)
+                        .map(|j| ((i * 7 + j * 3) % 11) as f32 * 0.01)
+                        .collect()
+                })
+                .collect();
+            let targets: Vec<usize> = (0..20).map(|i| i % 2).collect();
+            let fitted = Model::fit(
+                &data,
+                &targets,
+                vec!["empty".into(), "occupied".into()],
+                s,
+                window,
+                cfg.fit,
+            )
+            .unwrap();
+            let enc = fitted.encoder.clone();
+            let shaped = shaped_like(s, &cfg, enc.as_ref());
+            let dir = std::env::temp_dir();
+            let (a, b) = (
+                dir.join(format!("r2-fit-{wander}-{features}.st")),
+                dir.join(format!("r2-shape-{wander}-{features}.st")),
+            );
+            fitted.save(&a).unwrap();
+            shaped.save(&b).unwrap();
+            let size = |p: &std::path::Path| std::fs::metadata(p).unwrap().len();
+            assert_eq!(size(&a), size(&b), "wander {wander}, features {features}");
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        }
+    }
 
     #[test]
     fn file_names_name_their_scenario_and_the_rate_logs_are_left_out() {
