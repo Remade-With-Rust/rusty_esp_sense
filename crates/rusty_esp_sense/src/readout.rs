@@ -207,9 +207,11 @@ fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f6
 #[inline(never)]
 fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
     for j in 0..d {
+        // The row's prefix as a slice: the same subtractions in the same
+        // order, without a bounds check on each of two indexings per trip.
         let mut s = a[j * d + j];
-        for p in 0..j {
-            s -= a[j * d + p] * a[j * d + p];
+        for &v in &a[j * d..j * d + j] {
+            s -= v * v;
         }
         if s <= 0.0 || !s.is_finite() {
             return false;
