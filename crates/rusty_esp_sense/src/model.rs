@@ -88,8 +88,8 @@ impl Model {
     ///
     /// [`crate::Error::Input`] when there is nothing to fit, a target is out
     /// of range, or a window has the wrong width; a tensor error otherwise.
-    pub fn fit(
-        data: &[Vec<f32>],
+    pub fn fit<R: AsRef<[f32]>>(
+        data: &[R],
         targets: &[usize],
         labels: Vec<String>,
         subcarriers: usize,
@@ -108,8 +108,8 @@ impl Model {
     /// # Errors
     ///
     /// As [`Model::fit`].
-    pub fn fit_with(
-        data: &[Vec<f32>],
+    pub fn fit_with<R: AsRef<[f32]>>(
+        data: &[R],
         targets: &[usize],
         labels: Vec<String>,
         subcarriers: usize,

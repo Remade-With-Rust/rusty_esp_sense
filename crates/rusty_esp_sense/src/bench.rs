@@ -351,9 +351,10 @@ fn fit_on(
         let mut data = Vec::new();
         let mut targets = Vec::new();
         for p in prepared {
+            // Borrowed, not cloned: the fit copies each row once, into the
+            // tensor it stacks.
             for w in &p.windows {
-                prof::add(Counter::WindowCloneBytes, (w.len() * 4) as u64);
-                data.push(w.clone());
+                data.push(w.as_slice());
                 targets.push(usize::from(p.scenario.occupied()));
             }
         }
