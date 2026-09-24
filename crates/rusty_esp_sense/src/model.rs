@@ -139,10 +139,12 @@ impl Model {
             };
             (input, phi)
         };
-        let y: Vec<f32> = targets
-            .iter()
-            .flat_map(|&t| (0..k).map(move |j| if j == t { 1.0 } else { -1.0 }))
-            .collect();
+        // One-hot, +1 / -1, k per window: sized once (a flattening
+        // iterator's size hint starts at zero, so collecting it doubled).
+        let mut y: Vec<f32> = Vec::with_capacity(targets.len() * k);
+        for &t in targets {
+            y.extend((0..k).map(|j| if j == t { 1.0 } else { -1.0 }));
+        }
         let ridge = Ridge::fit(&phi, &y, k, cfg.alpha)?;
         Ok(Model {
             window,
