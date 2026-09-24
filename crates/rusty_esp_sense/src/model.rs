@@ -67,16 +67,16 @@ pub struct Model {
     pub labels: Vec<String>,
 }
 
-fn stack(data: &[Vec<f32>], width: usize) -> crate::Result<Tensor> {
+fn stack<R: AsRef<[f32]>>(data: &[R], width: usize) -> crate::Result<Tensor> {
     let _g = prof::scope(Stage::Stack);
     prof::add(Counter::StackBytes, (data.len() * width * 4) as u64);
     prof::add(Counter::TensorBuilds, 1);
-    if data.iter().any(|w| w.len() != width) {
+    if data.iter().any(|w| w.as_ref().len() != width) {
         return Err(crate::Error::Input(format!(
             "a window is not {width} values wide"
         )));
     }
-    let flat: Vec<f32> = data.iter().flatten().copied().collect();
+    let flat: Vec<f32> = data.iter().flat_map(|w| w.as_ref()).copied().collect();
     Ok(Tensor::from_vec(flat, (data.len(), width), &Device::Cpu)?)
 }
 
@@ -171,7 +171,7 @@ impl Model {
     /// # Errors
     ///
     /// [`crate::Error::Input`] when a window has the wrong width.
-    pub fn scores(&self, data: &[Vec<f32>]) -> crate::Result<Vec<Vec<f32>>> {
+    pub fn scores<R: AsRef<[f32]>>(&self, data: &[R]) -> crate::Result<Vec<Vec<f32>>> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
@@ -187,7 +187,7 @@ impl Model {
     /// # Errors
     ///
     /// As [`Model::scores`].
-    pub fn classify(&self, data: &[Vec<f32>]) -> crate::Result<Vec<usize>> {
+    pub fn classify<R: AsRef<[f32]>>(&self, data: &[R]) -> crate::Result<Vec<usize>> {
         let scores = self.scores(data)?;
         let _g = prof::scope(Stage::Classify);
         Ok(scores

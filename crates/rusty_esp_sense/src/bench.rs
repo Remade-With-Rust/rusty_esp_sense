@@ -315,17 +315,29 @@ fn table(rows: &[(Scenario, Vec<bool>)]) -> Table {
         .collect()
 }
 
-fn called_occupied(model: &Model, windows: &[Vec<f32>]) -> crate::Result<Vec<bool>> {
+/// Every capture's calls, from ONE scoring pass over all their windows:
+/// scored one capture at a time, each call rebuilt the standardisation and
+/// readout tensors for the same model. Each window's scores are its own
+/// row's, so the split back per capture is exact.
+fn called_occupied(model: &Model, captures: &[&Prepared]) -> crate::Result<Vec<Vec<bool>>> {
     let occupied = model
         .labels
         .iter()
         .position(|l| l == "occupied")
         .ok_or_else(|| crate::Error::Model("no `occupied` label".into()))?;
-    Ok(model
-        .classify(windows)?
-        .into_iter()
-        .map(|c| c == occupied)
-        .collect())
+    let rows: Vec<&[f32]> = captures
+        .iter()
+        .flat_map(|p| p.windows.iter().map(Vec::as_slice))
+        .collect();
+    let calls = model.classify(&rows)?;
+    let mut out = Vec::with_capacity(captures.len());
+    let mut at = 0;
+    for p in captures {
+        let n = p.windows.len();
+        out.push(calls[at..at + n].iter().map(|&c| c == occupied).collect());
+        at += n;
+    }
+    Ok(out)
 }
 
 fn fit_on(
@@ -448,8 +460,8 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
             continue;
         }
         let model = fit_on(&train, subcarriers, cfg, encoder.as_ref())?;
-        for p in test {
-            held.push((p.scenario, called_occupied(&model, &p.windows)?));
+        for (p, calls) in test.iter().zip(called_occupied(&model, &test)?) {
+            held.push((p.scenario, calls));
         }
     }
 
@@ -461,11 +473,12 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
     let mut confound = Vec::new();
     if !e12.is_empty() {
         let model = fit_on(&e12, subcarriers, cfg, encoder.as_ref())?;
-        for p in prepared
+        let later: Vec<&Prepared> = prepared
             .iter()
             .filter(|p| matches!(p.scenario, Scenario::Traffic | Scenario::Coexistence))
-        {
-            confound.push((p.scenario, called_occupied(&model, &p.windows)?));
+            .collect();
+        for (p, calls) in later.iter().zip(called_occupied(&model, &later)?) {
+            confound.push((p.scenario, calls));
         }
     }
 
