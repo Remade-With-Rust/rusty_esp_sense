@@ -308,17 +308,19 @@ fn called_occupied(model: &Model, windows: &[Vec<f32>]) -> crate::Result<Vec<boo
 }
 
 fn fit_on(prepared: &[&Prepared], subcarriers: usize, cfg: &BenchConfig) -> crate::Result<Model> {
-    let gather = prof::scope(Stage::Gather);
-    let mut data = Vec::new();
-    let mut targets = Vec::new();
-    for p in prepared {
-        for w in &p.windows {
-            prof::add(Counter::WindowCloneBytes, (w.len() * 4) as u64);
-            data.push(w.clone());
-            targets.push(usize::from(p.scenario.occupied()));
+    let (data, targets) = {
+        let _g = prof::scope(Stage::Gather);
+        let mut data = Vec::new();
+        let mut targets = Vec::new();
+        for p in prepared {
+            for w in &p.windows {
+                prof::add(Counter::WindowCloneBytes, (w.len() * 4) as u64);
+                data.push(w.clone());
+                targets.push(usize::from(p.scenario.occupied()));
+            }
         }
-    }
-    drop(gather);
+        (data, targets)
+    };
     Model::fit(
         &data,
         &targets,
