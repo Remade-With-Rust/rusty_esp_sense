@@ -219,10 +219,16 @@ fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
         let ljj = s.sqrt();
         a[j * d + j] = ljj;
         for i in j + 1..d {
-            let mut s = a[i * d + j];
-            for p in 0..j {
-                s -= a[i * d + p] * a[j * d + p];
-            }
+            // Both rows' prefixes as slices, zipped: the same order, no
+            // bounds check per trip; the write waits until they are done.
+            let s = {
+                let (row_i, row_j) = (&a[i * d..i * d + j], &a[j * d..j * d + j]);
+                let mut s = a[i * d + j];
+                for (&x, &y) in row_i.iter().zip(row_j) {
+                    s -= x * y;
+                }
+                s
+            };
             a[i * d + j] = s / ljj;
         }
     }
