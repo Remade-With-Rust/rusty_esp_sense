@@ -1,0 +1,49 @@
+# cargo-deny configuration — the permissive-only, no-C posture, enforced.
+# Run: cargo deny check
+
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# A `*-sys` crate is a decision stated out loud in the PR, never a default.
+deny = [
+  { crate = "openssl-sys", reason = "no C toolchain anywhere in the build" },
+  { crate = "libz-sys", reason = "use rusty_zstd / pure-Rust inflate" },
+  { crate = "zstd-sys", reason = "use rusty_zstd" },
+  { crate = "ring", reason = "platform asm; use RustCrypto / rustls-rustcrypto" },
+  { crate = "aws-lc-sys", reason = "C; use RustCrypto / rustls-rustcrypto" },
+]
+
+[advisories]
+ignore = [
+  # `paste` is unmaintained (not vulnerable): a proc-macro that candle's
+  # matmul backend (gemm) uses at compile time. Nothing at this layer can
+  # replace it; it goes when candle moves off it.
+  { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro inside candle's gemm; unmaintained, not vulnerable" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+  "https://github.com/Remade-With-Rust/rusty_esp_core",
+  "https://github.com/Remade-With-Rust/rusty_esp_dsp",
+  "https://github.com/Remade-With-Rust/rusty_esp_mid",
+  "https://github.com/Remade-With-Rust/rusty_esp_signal",
+  "https://github.com/Remade-With-Rust/rusty_esp_iroh",
+  # rusty_esp_mid-core brings the mID wire types in from the upstream branch
+  "https://github.com/Remade-With-Rust/mid",
+]

@@ -1,0 +1,33 @@
+[package]
+name = "rusty_esp_sense"
+description = "Janus W6: the home computer's model over Wi-Fi channel state -- fixed random features, a readout calibrated per room, and a benchmark that holds out whole captures."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+keywords = ["esp32", "wifi-sensing", "csi", "mata", "remade-with-rust"]
+categories = ["science", "command-line-utilities"]
+# Not yet: its sibling dependencies are git branches until the Janus W5 PRs
+# merge and publish.
+publish = false
+
+[features]
+default = []
+# `rusty_esp_sense watch <ticket>`: subscribe to a device's (or a bridge's)
+# W5 CSI stream over iroh and read the room live. Off by default so the
+# offline build carries no network stack.
+live = ["dep:rusty_esp_iroh-host", "dep:tokio"]
+
+[dependencies]
+rusty_esp_signal-core = { workspace = true, features = ["std"] }
+candle-core = { workspace = true }
+serde_json = { workspace = true }
+rusty_esp_iroh-host = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+
+[lints]
+workspace = true

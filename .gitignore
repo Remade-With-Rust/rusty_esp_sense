@@ -1,0 +1,8 @@
+/target
+**/target
+*.log
+.DS_Store
+Thumbs.db
+
+# Umbrella-only sibling patches (the Janus checkout's, never committed)
+/.cargo/config.toml

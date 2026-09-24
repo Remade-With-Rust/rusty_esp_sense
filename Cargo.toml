@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/rusty_esp_sense"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/rusty_esp_sense"
+homepage = "https://www.mata.network/"
+authors = ["Remade With Rust"]
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.dependencies]
+# Siblings in the Janus family are consumed BY GIT URL so this repo deploys on
+# its own; inside the umbrella, `.cargo/config.toml` patches them to the
+# checkouts.
+rusty_esp_signal-core = { git = "https://github.com/Remade-With-Rust/rusty_esp_signal", branch = "w5/csi-stream", version = "0.2", default-features = false }
+# The live subscriber only (feature `live`): the W5 stream's decoder and the
+# iroh client that subscribes to it.
+rusty_esp_iroh-host = { git = "https://github.com/Remade-With-Rust/rusty_esp_iroh", branch = "w5/csi-stream", version = "0.1", default-features = false }
+tokio = { version = "1", default-features = false, features = ["rt"] }
+
+# The tensor spine (house rule: candle for every non-LLM model). CPU only:
+# no `cuda` / `metal`, which would pull C toolchains in.
+candle-core = { version = "0.11", default-features = false }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
