@@ -76,7 +76,13 @@ fn stack<R: AsRef<[f32]>>(data: &[R], width: usize) -> crate::Result<Tensor> {
             "a window is not {width} values wide"
         )));
     }
-    let flat: Vec<f32> = data.iter().flat_map(|w| w.as_ref()).copied().collect();
+    // Sized once: collecting a flattening iterator (whose size hint starts
+    // at zero) grew the buffer by doubling, a fresh allocation and a copy
+    // each time.
+    let mut flat: Vec<f32> = Vec::with_capacity(data.len() * width);
+    for w in data {
+        flat.extend_from_slice(w.as_ref());
+    }
     Ok(Tensor::from_vec(flat, (data.len(), width), &Device::Cpu)?)
 }
 
