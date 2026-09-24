@@ -123,9 +123,7 @@ pub fn epochs_iter<I: IntoIterator<Item = Sample>>(samples: I, cfg: &NightConfig
 }
 
 /// [`epochs`] over `(time, sample)` pairs: each sample read at the time
-/// given beside it, owned or borrowed. A caller that re-times recordings
-/// (the night benchmark plays captures end to end) passes the new time and
-/// a reference, instead of copying every sample to change its timestamp.
+/// given beside it, owned or borrowed.
 #[must_use]
 pub fn epochs_at<S, I>(samples: I, cfg: &NightConfig) -> Vec<Epoch>
 where
@@ -133,48 +131,84 @@ where
     I: IntoIterator<Item = (Micros, S)>,
 {
     let _g = prof::scope(Stage::Night);
-    let mut samples = samples.into_iter().peekable();
-    let mut pushed = 0u64;
-    let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
-    let mut vit: Box<VitalsEstimator<200>> =
-        Box::new(VitalsEstimator::new(VitalsConfig::breathing(cfg.frame_hz)));
-    let mut out = Vec::new();
-    let Some(&(first, _)) = samples.peek() else {
-        return out;
-    };
-    let mut start = first;
-    let (mut frames, mut moving) = (0usize, 0usize);
-    let mut breath: Option<(u16, u16)> = None;
+    let mut b = EpochBuilder::new(cfg);
     for (at, s) in samples {
-        let s: &Sample = s.borrow();
-        pushed += 1;
-        while at.0 >= start.0 + cfg.epoch.0 {
-            close(start, frames, moving, breath, &mut out);
-            start = Micros(start.0 + cfg.epoch.0);
-            frames = 0;
-            moving = 0;
-            breath = None;
+        b.push(at, s.borrow());
+    }
+    b.finish()
+}
+
+/// Epochs built one sample at a time. A caller that re-times recordings
+/// (the night benchmark plays captures end to end) pushes each sample by
+/// reference with its new time -- no copy of the sample to change its
+/// timestamp, and no iterator chain between the loop and the estimators.
+pub struct EpochBuilder {
+    cfg: NightConfig,
+    det: PresenceDetector<50>,
+    vit: Box<VitalsEstimator<200>>,
+    out: Vec<Epoch>,
+    start: Option<Micros>,
+    frames: usize,
+    moving: usize,
+    breath: Option<(u16, u16)>,
+    pushed: u64,
+}
+
+impl EpochBuilder {
+    /// An empty night.
+    #[must_use]
+    pub fn new(cfg: &NightConfig) -> Self {
+        EpochBuilder {
+            cfg: *cfg,
+            det: PresenceDetector::new(DetectorConfig::normalised_default()),
+            vit: Box::new(VitalsEstimator::new(VitalsConfig::breathing(cfg.frame_hz))),
+            out: Vec::new(),
+            start: None,
+            frames: 0,
+            moving: 0,
+            breath: None,
+            pushed: 0,
         }
-        let Ok(f) = s.features() else { continue };
+    }
+
+    /// One sample, read at `at`.
+    pub fn push(&mut self, at: Micros, s: &Sample) {
+        self.pushed += 1;
+        let start = self.start.get_or_insert(at);
+        while at.0 >= start.0 + self.cfg.epoch.0 {
+            close(*start, self.frames, self.moving, self.breath, &mut self.out);
+            *start = Micros(start.0 + self.cfg.epoch.0);
+            self.frames = 0;
+            self.moving = 0;
+            self.breath = None;
+        }
+        let Ok(f) = s.features() else { return };
         let norm = f.normalised();
-        det.push(&norm, at);
-        if let Some(v) = vit.push(&norm, at) {
+        self.det.push(&norm, at);
+        if let Some(v) = self.vit.push(&norm, at) {
             if v.accepted {
-                breath = Some((v.bpm_x10, v.confidence));
+                self.breath = Some((v.bpm_x10, v.confidence));
             }
         }
-        if det.warm() {
-            frames += 1;
-            if det.wander() >= cfg.active_permille {
-                moving += 1;
+        if self.det.warm() {
+            self.frames += 1;
+            if self.det.wander() >= self.cfg.active_permille {
+                self.moving += 1;
             }
         }
     }
-    close(start, frames, moving, breath, &mut out);
-    prof::add(Counter::DetectorPushes, pushed);
-    prof::add(Counter::VitalsPushes, pushed);
-    prof::add(Counter::FeatureComputations, pushed);
-    out
+
+    /// The night's epochs, the last one closed.
+    #[must_use]
+    pub fn finish(mut self) -> Vec<Epoch> {
+        if let Some(start) = self.start {
+            close(start, self.frames, self.moving, self.breath, &mut self.out);
+        }
+        prof::add(Counter::DetectorPushes, self.pushed);
+        prof::add(Counter::VitalsPushes, self.pushed);
+        prof::add(Counter::FeatureComputations, self.pushed);
+        self.out
+    }
 }
 
 fn close(
