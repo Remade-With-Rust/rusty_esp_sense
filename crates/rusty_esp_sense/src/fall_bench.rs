@@ -16,6 +16,7 @@
 //!    walking wander, a burst, real empty-room wander -- must raise an event;
 //!    walking then empty with no burst (someone leaving) must not.
 
+use rayon::prelude::*;
 use rusty_esp_signal_core::esp_core::Micros;
 use rusty_esp_signal_core::radar::csi::{Config as DetectorConfig, PresenceDetector};
 use rusty_esp_signal_core::radar::fall::{FallConfig, FallDetector};
@@ -145,19 +146,39 @@ fn scenario_rank(s: Scenario) -> usize {
 /// Run it. `burst` of `None` uses [`FallConfig::normalised_default`].
 #[must_use]
 pub fn run(recordings: &[Recording], burst: Option<u16>) -> FallReport {
+    // Alternate captures of each scenario, in order, go to the tuning half
+    // and the test half. The halves are assigned first; each capture's
+    // detector pass depends on that capture alone, so the passes run in
+    // parallel and come back in recording order. The tuning half is only
+    // ever asked for its peak, so its streams are reduced as they are made,
+    // not stored.
     let mut seen = [0usize; 4];
-    // The tuning half is only ever asked for its peak, so its streams are
-    // reduced as they are made, not stored.
+    let tunes: Vec<bool> = recordings
+        .iter()
+        .map(|r| {
+            let i = scenario_rank(r.scenario);
+            seen[i] += 1;
+            seen[i] % 2 == 0
+        })
+        .collect();
+    let passes: Vec<Result<u16, Stream>> = recordings
+        .par_iter()
+        .zip(&tunes)
+        .map(|(r, &tune)| {
+            if tune {
+                Ok(wander_peak(r))
+            } else {
+                Err(wander_stream(r))
+            }
+        })
+        .collect();
     let mut tuning: Vec<(Scenario, u16)> = Vec::new();
     let mut test: Vec<(Scenario, Stream)> = Vec::new();
-    for r in recordings {
-        let i = scenario_rank(r.scenario);
-        if seen[i] % 2 == 1 {
-            tuning.push((r.scenario, wander_peak(r)));
-        } else {
-            test.push((r.scenario, wander_stream(r)));
+    for (r, pass) in recordings.iter().zip(passes) {
+        match pass {
+            Ok(peak) => tuning.push((r.scenario, peak)),
+            Err(stream) => test.push((r.scenario, stream)),
         }
-        seen[i] += 1;
     }
     let tuning_max = Scenario::ALL
         .iter()
