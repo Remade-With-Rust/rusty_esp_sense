@@ -160,6 +160,9 @@ pub fn epochs_iter<I: IntoIterator<Item = Sample>>(samples: I, cfg: &NightConfig
     prof::add(Counter::DetectorPushes, pushed);
     prof::add(Counter::VitalsPushes, pushed);
     prof::add(Counter::FeatureComputations, pushed);
+    // Every sample arrives here by value: a copy of the whole record (the
+    // callers copy or re-time each one to pass it).
+    prof::add(Counter::SampleCopies, pushed);
     out
 }
 
