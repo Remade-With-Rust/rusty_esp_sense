@@ -260,35 +260,32 @@ const PANEL: usize = 16;
 ///
 /// Blocked by panels of [`PANEL`] columns, for the cache: before a panel is
 /// finished, the products over every earlier column are subtracted from it
-/// one [`PANEL`]-wide block of columns at a time, ascending, the running
-/// value stored back between blocks. Each entry therefore sees exactly the
-/// subtractions of the unblocked loop in exactly its order -- the blocks
-/// only change which entries are worked on while a tile sits in L1.
+/// row by row, each row's prefix streamed once against the packed panel.
+/// Each entry sees exactly the subtractions of the unblocked loop in
+/// exactly its order -- blocking changes only which entries are worked on
+/// together.
 #[inline(never)]
 fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
-    // tile[p][jj] = L[j0 + jj][p0 + p]: the panel's rows over one block of
-    // earlier columns, packed so sixteen columns load side by side.
-    let mut tile = [[0f64; PANEL]; PANEL];
+    // pack[p][jj] = L[j0 + jj][p]: the panel's rows over EVERY earlier
+    // column, packed so sixteen columns load side by side (16·j0 values,
+    // at most 128 KiB at d = 1024: L2).
+    let mut pack: Vec<[f64; PANEL]> = Vec::with_capacity(d);
     let mut j0 = 0;
     while j0 < d {
         let j1 = (j0 + PANEL).min(d);
         let w = j1 - j0;
-        let mut p0 = 0;
-        while p0 < j0 {
-            for (p, t) in tile.iter_mut().enumerate() {
-                for (jj, v) in t.iter_mut().enumerate() {
-                    *v = if jj < w {
-                        a[(j0 + jj) * d + p0 + p]
-                    } else {
-                        0.0
-                    };
+        if j0 > 0 {
+            pack.clear();
+            pack.resize(j0, [0.0; PANEL]);
+            for jj in 0..w {
+                for (t, &v) in pack.iter_mut().zip(&a[(j0 + jj) * d..(j0 + jj) * d + j0]) {
+                    t[jj] = v;
                 }
             }
             for i in j0..d {
                 let jn = (i + 1).min(j1) - j0;
-                update_row(&mut a[i * d..i * d + j1], p0, j0, jn, &tile);
+                update_row(&mut a[i * d..i * d + j1], j0, jn, &pack);
             }
-            p0 += PANEL;
         }
         if !factor_panel(a, d, j0, j1) {
             return false;
@@ -298,21 +295,21 @@ fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
     true
 }
 
-/// `row[j0 + jj] -= Σ_p row[p0 + p] · tile[p][jj]` for `jj < jn`, the sum
-/// over `p` in order: sixteen independent accumulators side by side, each
-/// subtracted exactly as the unblocked loop subtracts. Lanes at or past
-/// `jn` compute and are dropped.
+/// `row[j0 + jj] -= Σ_p row[p] · pack[p][jj]` over every earlier column
+/// `p < j0`, in order, for `jj < jn`: sixteen independent accumulators side
+/// by side, kept in registers the whole row, each subtracted exactly as the
+/// unblocked loop subtracts. Lanes at or past `jn` compute and are dropped.
 #[inline(never)]
-fn update_row(row: &mut [f64], p0: usize, j0: usize, jn: usize, tile: &[[f64; PANEL]; PANEL]) {
+fn update_row(row: &mut [f64], j0: usize, jn: usize, pack: &[[f64; PANEL]]) {
+    let (prefix, panel) = row.split_at_mut(j0);
     let mut acc = [0f64; PANEL];
-    acc[..jn].copy_from_slice(&row[j0..j0 + jn]);
-    let x = &row[p0..p0 + PANEL];
-    for (&xp, t) in x.iter().zip(tile) {
+    acc[..jn].copy_from_slice(&panel[..jn]);
+    for (&xp, t) in prefix.iter().zip(pack) {
         for (s, &y) in acc.iter_mut().zip(t) {
             *s -= xp * y;
         }
     }
-    row[j0..j0 + jn].copy_from_slice(&acc[..jn]);
+    panel[..jn].copy_from_slice(&acc[..jn]);
 }
 
 /// Finish columns `from..to`: subtract the products over columns
