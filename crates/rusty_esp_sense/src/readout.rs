@@ -233,22 +233,34 @@ impl Ridge {
             .map(|k| f64::from(y[k]) - intercept[k % outputs])
             .collect();
         let yc = Tensor::from_vec(yc, (n, outputs), &Device::Cpu)?;
-        let (mut gram, rhs) = {
-            let _g = prof::scope(Stage::Gram);
-            prof::add(Counter::GramMacs, (n * d * outputs) as u64);
-            // The transposed VIEW: the multiply reads it by stride, so the
-            // full transposed copy `.contiguous()` made is not needed.
-            let zt = z.t()?;
-            let gram = lower_gram(&zt, &z, d)?;
-            let rhs: Vec<f64> = zt.matmul(&yc)?.flatten_all()?.to_vec1()?;
-            (gram, rhs)
-        };
-        let lambda = alpha * n as f64;
-        for i in 0..d {
-            gram[i * d + i] += lambda;
-        }
-        let beta = cholesky_solve(&mut gram, d, &rhs, outputs)
-            .ok_or_else(|| crate::Error::Input("ridge: not positive definite".into()))?;
+        // The Gram matrix and the factor's packed panel come from this
+        // thread's scratch and go back to it, so a fit that follows another
+        // on the same thread (one thread, or --fit-jobs) reuses them instead
+        // of taking fresh pages from the OS. Taken out for the duration, not
+        // borrowed: a fit waiting inside a multiply can have another fit
+        // stolen onto this thread, and that one simply finds it empty.
+        let mut scratch = SCRATCH.with(|c| c.take());
+        let solved = (|| {
+            let (gram, pack) = (&mut scratch.gram, &mut scratch.pack);
+            let rhs = {
+                let _g = prof::scope(Stage::Gram);
+                prof::add(Counter::GramMacs, (n * d * outputs) as u64);
+                // The transposed VIEW: the multiply reads it by stride, so
+                // the full transposed copy `.contiguous()` made is not needed.
+                let zt = z.t()?;
+                lower_gram(&zt, &z, d, gram)?;
+                let rhs: Vec<f64> = zt.matmul(&yc)?.flatten_all()?.to_vec1()?;
+                rhs
+            };
+            let lambda = alpha * n as f64;
+            for i in 0..d {
+                gram[i * d + i] += lambda;
+            }
+            cholesky_solve_with(gram, d, &rhs, outputs, pack)
+                .ok_or_else(|| crate::Error::Input("ridge: not positive definite".into()))
+        })();
+        SCRATCH.with(|c| c.set(scratch));
+        let beta = solved?;
         Ok(Ridge {
             norm,
             beta: beta.iter().map(|&b| b as f32).collect(),
@@ -299,8 +311,21 @@ impl Ridge {
 /// alone, so the rest of the square is never computed; it stays zero.
 const GRAM_PANEL: usize = 128;
 
-fn lower_gram(zt: &Tensor, z: &Tensor, d: usize) -> crate::Result<Vec<f64>> {
-    let mut gram = vec![0f64; d * d];
+/// A fit's reusable buffers: the Gram matrix and the factor's packed panel.
+#[derive(Default)]
+struct FitScratch {
+    gram: Vec<f64>,
+    pack: Vec<[f64; PANEL]>,
+}
+
+thread_local! {
+    static SCRATCH: core::cell::Cell<FitScratch> = core::cell::Cell::new(FitScratch::default());
+}
+
+fn lower_gram(zt: &Tensor, z: &Tensor, d: usize, gram: &mut Vec<f64>) -> crate::Result<()> {
+    // Every entry starts at zero, as a fresh `vec![0; d * d]` did.
+    gram.clear();
+    gram.resize(d * d, 0.0);
     let mut r0 = 0;
     while r0 < d {
         let r1 = (r0 + GRAM_PANEL).min(d);
@@ -318,7 +343,7 @@ fn lower_gram(zt: &Tensor, z: &Tensor, d: usize) -> crate::Result<Vec<f64>> {
         })?;
         r0 = r1;
     }
-    Ok(gram)
+    Ok(())
 }
 
 /// Solve `A X = B` for symmetric positive definite `A` (`d × d`, row-major,
@@ -330,7 +355,19 @@ fn lower_gram(zt: &Tensor, z: &Tensor, d: usize) -> crate::Result<Vec<f64>> {
 /// `tests::reference_solve` -- each sum runs in its original order; what
 /// is vectorised is independent accumulators side by side, never one sum
 /// reassociated.
+#[cfg(test)]
 fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f64>> {
+    cholesky_solve_with(a, d, b, k, &mut Vec::new())
+}
+
+/// [`cholesky_solve`] with the factor's packed panel in the caller's buffer.
+fn cholesky_solve_with(
+    a: &mut [f64],
+    d: usize,
+    b: &[f64],
+    k: usize,
+    pack: &mut Vec<[f64; PANEL]>,
+) -> Option<Vec<f64>> {
     let _g = prof::scope(Stage::Cholesky);
     // Inner-loop multiply-adds, exactly: the factor's plus two triangular
     // solves per right-hand side.
@@ -339,7 +376,7 @@ fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f6
         Counter::CholeskyMacs,
         factor + (k as u64) * (d as u64) * (d as u64).saturating_sub(1),
     );
-    if !cholesky_factor(a, d) {
+    if !cholesky_factor_with(a, d, pack) {
         return None;
     }
     let mut x = b.to_vec();
@@ -370,12 +407,20 @@ const PANEL: usize = 16;
 /// Each entry sees exactly the subtractions of the unblocked loop in
 /// exactly its order -- blocking changes only which entries are worked on
 /// together.
-#[inline(never)]
+#[cfg(test)]
 fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
+    cholesky_factor_with(a, d, &mut Vec::new())
+}
+
+/// The factor described above, its packed panel in the caller's buffer
+/// (reused fit after fit on a thread; [`cholesky_factor`] is this with a
+/// fresh one).
+#[inline(never)]
+fn cholesky_factor_with(a: &mut [f64], d: usize, pack: &mut Vec<[f64; PANEL]>) -> bool {
     // pack[p][jj] = L[j0 + jj][p]: the panel's rows over EVERY earlier
     // column, packed so sixteen columns load side by side (16·j0 values,
     // at most 128 KiB at d = 1024: L2).
-    let mut pack: Vec<[f64; PANEL]> = Vec::with_capacity(d);
+    pack.reserve(d);
     let mut j0 = 0;
     while j0 < d {
         let j1 = (j0 + PANEL).min(d);
@@ -390,7 +435,7 @@ fn cholesky_factor(a: &mut [f64], d: usize) -> bool {
             }
             for i in j0..d {
                 let jn = (i + 1).min(j1) - j0;
-                update_row(&mut a[i * d..i * d + j1], j0, jn, &pack);
+                update_row(&mut a[i * d..i * d + j1], j0, jn, pack);
             }
         }
         if !factor_panel(a, d, j0, j1) {
