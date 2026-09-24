@@ -36,19 +36,14 @@ impl Standardize {
         let nf = n as f64;
         let mut mean = vec![0f64; d];
         for row in v.chunks_exact(d) {
-            for (m, &e) in mean.iter_mut().zip(row) {
-                *m += f64::from(e);
-            }
+            widen_add(&mut mean, row);
         }
         for m in &mut mean {
             *m /= nf;
         }
         let mut var = vec![0f64; d];
         for row in v.chunks_exact(d) {
-            for ((s, &e), &m) in var.iter_mut().zip(row).zip(&mean) {
-                let dev = f64::from(e) - m;
-                *s += dev * dev;
-            }
+            widen_add_squared_deviations(&mut var, row, &mean);
         }
         for s in &mut var {
             *s /= nf;
@@ -88,6 +83,26 @@ impl Standardize {
             }
         }
         Ok(Tensor::from_vec(v, (n, d), &Device::Cpu)?)
+    }
+}
+
+/// `acc[c] += row[c] as f64`, every column's accumulator side by side --
+/// each still summed over rows in order. Its own frame so the slices arrive
+/// as non-aliasing parameters and the loop vectorises; inlined into
+/// [`Standardize::fit`] it stayed scalar (the census, as for `wander`).
+#[inline(never)]
+fn widen_add(acc: &mut [f64], row: &[f32]) {
+    for (a, &e) in acc.iter_mut().zip(row) {
+        *a += f64::from(e);
+    }
+}
+
+/// `acc[c] += (row[c] as f64 - mean[c])²`, as [`widen_add`].
+#[inline(never)]
+fn widen_add_squared_deviations(acc: &mut [f64], row: &[f32], mean: &[f64]) {
+    for ((a, &e), &m) in acc.iter_mut().zip(row).zip(mean) {
+        let dev = f64::from(e) - m;
+        *a += dev * dev;
     }
 }
 
