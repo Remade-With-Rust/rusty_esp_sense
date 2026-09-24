@@ -112,21 +112,28 @@ impl State {
 /// Measure a recording's epochs.
 #[must_use]
 pub fn epochs(samples: &[Sample], cfg: &NightConfig) -> Vec<Epoch> {
+    epochs_iter(samples.iter().copied(), cfg)
+}
+
+/// [`epochs`] over samples as they come: a caller that re-times or splices
+/// recordings passes them through without storing the result first.
+#[must_use]
+pub fn epochs_iter<I: IntoIterator<Item = Sample>>(samples: I, cfg: &NightConfig) -> Vec<Epoch> {
     let _g = prof::scope(Stage::Night);
-    prof::add(Counter::DetectorPushes, samples.len() as u64);
-    prof::add(Counter::VitalsPushes, samples.len() as u64);
-    prof::add(Counter::FeatureComputations, samples.len() as u64);
+    let mut samples = samples.into_iter().peekable();
+    let mut pushed = 0u64;
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
     let mut vit: Box<VitalsEstimator<200>> =
         Box::new(VitalsEstimator::new(VitalsConfig::breathing(cfg.frame_hz)));
     let mut out = Vec::new();
-    let Some(first) = samples.first() else {
+    let Some(first) = samples.peek() else {
         return out;
     };
     let mut start = first.at;
     let (mut frames, mut moving) = (0usize, 0usize);
     let mut breath: Option<(u16, u16)> = None;
     for s in samples {
+        pushed += 1;
         while s.at.0 >= start.0 + cfg.epoch.0 {
             close(start, frames, moving, breath, &mut out);
             start = Micros(start.0 + cfg.epoch.0);
@@ -150,6 +157,9 @@ pub fn epochs(samples: &[Sample], cfg: &NightConfig) -> Vec<Epoch> {
         }
     }
     close(start, frames, moving, breath, &mut out);
+    prof::add(Counter::DetectorPushes, pushed);
+    prof::add(Counter::VitalsPushes, pushed);
+    prof::add(Counter::FeatureComputations, pushed);
     out
 }
 

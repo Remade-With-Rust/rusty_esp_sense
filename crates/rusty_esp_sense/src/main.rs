@@ -543,24 +543,31 @@ fn bench_night(args: &mut Args) -> Result<(), String> {
     );
     println!("  scenario                epochs   empty   awake  asleep  breathing accepted");
     for s in Scenario::ALL {
-        let mut all = Vec::new();
+        // Played end to end by re-timing each capture to follow the last --
+        // on the fly: the samples were copied into a new vector (42 MB)
+        // only to be read once.
+        let caps: Vec<_> = recs.iter().filter(|r| r.scenario == s).collect();
+        let mut offsets = Vec::with_capacity(caps.len());
         let mut offset = 0u64;
-        for r in recs.iter().filter(|r| r.scenario == s) {
+        for r in &caps {
+            offsets.push(offset);
             let base = r.capture.samples.first().map_or(0, |x| x.at.0);
-            let mut end = offset;
-            rusty_esp_sense::prof::add(
-                rusty_esp_sense::prof::Counter::SampleCopies,
-                r.capture.samples.len() as u64,
-            );
-            for x in &r.capture.samples {
-                let mut y = *x;
-                y.at = Micros(offset + (x.at.0 - base));
-                end = y.at.0;
-                all.push(y);
-            }
+            let end = r
+                .capture
+                .samples
+                .last()
+                .map_or(offset, |x| offset + (x.at.0 - base));
             offset = end + bench::FRAME_US;
         }
-        let epochs = sleep::epochs(&all, &cfg);
+        let retimed = caps.iter().zip(offsets).flat_map(|(r, off)| {
+            let base = r.capture.samples.first().map_or(0, |x| x.at.0);
+            r.capture.samples.iter().map(move |x| {
+                let mut y = *x;
+                y.at = Micros(off + (x.at.0 - base));
+                y
+            })
+        });
+        let epochs = sleep::epochs_iter(retimed, &cfg);
         let states = sleep::score(&epochs, &cfg);
         let count = |k: State| states.iter().filter(|&&x| x == k).count();
         let breathed = epochs
