@@ -195,9 +195,16 @@ fn cholesky_solve(a: &mut [f64], d: usize, b: &[f64], k: usize) -> Option<Vec<f6
         return None;
     }
     let mut x = b.to_vec();
-    for c in 0..k {
-        solve_forward(a, d, &mut x, k, c);
-        solve_back(a, d, &mut x, k, c);
+    if k == 2 {
+        solve_forward_pair(a, d, &mut x);
+        for c in 0..k {
+            solve_back(a, d, &mut x, k, c);
+        }
+    } else {
+        for c in 0..k {
+            solve_forward(a, d, &mut x, k, c);
+            solve_back(a, d, &mut x, k, c);
+        }
     }
     Some(x)
 }
@@ -274,6 +281,30 @@ fn solve_forward(a: &[f64], d: usize, x: &mut [f64], k: usize, c: usize) {
             s -= a[i * d + p] * x[p * k + c];
         }
         x[i * k + c] = s / a[i * d + i];
+    }
+}
+
+/// `L y = b` for both columns of a two-column `x` (`d × 2`) at once: two
+/// independent lanes, each subtracted in its own column's order, sharing
+/// each load of `L` -- and each row's pair of `x` is contiguous, so the
+/// lanes load, multiply and subtract as one packed pair. Bit for bit two
+/// calls of [`solve_forward`]; the two columns' back-substitutions run
+/// after, as before, since a column's forward and back solves never read
+/// the other column.
+#[inline(never)]
+fn solve_forward_pair(a: &[f64], d: usize, x: &mut [f64]) {
+    for i in 0..d {
+        let s = {
+            let mut s = [x[2 * i], x[2 * i + 1]];
+            for (&l, pair) in a[i * d..i * d + i].iter().zip(x.chunks_exact(2)) {
+                s[0] -= l * pair[0];
+                s[1] -= l * pair[1];
+            }
+            s
+        };
+        let dii = a[i * d + i];
+        x[2 * i] = s[0] / dii;
+        x[2 * i + 1] = s[1] / dii;
     }
 }
 
