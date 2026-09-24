@@ -195,6 +195,60 @@ pub fn windows(samples: &[Sample], cfg: WindowConfig) -> Windows {
     }
 }
 
+/// The windows of a run of samples in one buffer, `width` values each:
+/// what [`windows`] returns, without a heap vector per window.
+#[derive(Debug, Clone, Default)]
+pub struct FlatWindows {
+    /// Subcarriers per frame (every window has the same).
+    pub subcarriers: usize,
+    /// Every window, one after another.
+    pub data: Vec<f32>,
+    /// Values per window.
+    pub width: usize,
+    /// Windows in `data`.
+    pub count: usize,
+    /// Frames skipped, as [`Windows::skipped`].
+    pub skipped: usize,
+}
+
+impl FlatWindows {
+    /// Each window, in order.
+    pub fn rows(&self) -> core::slice::ChunksExact<'_, f32> {
+        self.data.chunks_exact(self.width.max(1))
+    }
+}
+
+/// [`windows`] into one buffer, sized once from the first frame's width: a
+/// window takes exactly `cfg.frames` frames, so there are at most
+/// `samples / frames` of them.
+#[must_use]
+pub fn windows_flat(samples: &[Sample], cfg: WindowConfig) -> FlatWindows {
+    let _g = prof::scope(Stage::Window);
+    prof::add(Counter::FeatureComputations, samples.len() as u64);
+    let most = samples.len() / cfg.frames.max(1);
+    let mut b = WindowBuilder::new(cfg);
+    let mut data = Vec::new();
+    let mut count = 0usize;
+    for s in samples {
+        let norm = s.features().ok().map(|f| f.normalised());
+        if data.capacity() == 0 {
+            if let Some(f) = &norm {
+                data.reserve_exact(most * cfg.width(f.amplitudes().len()));
+            }
+        }
+        if b.push_into(norm.as_ref(), &mut data) {
+            count += 1;
+        }
+    }
+    FlatWindows {
+        subcarriers: b.subcarriers,
+        width: cfg.width(b.subcarriers),
+        data,
+        count,
+        skipped: b.skipped,
+    }
+}
+
 /// Each subcarrier's standard deviation over the `t` frames of `frames`
 /// (frame-major).
 ///
@@ -289,6 +343,41 @@ fn flatten_into(frames: &[f32], t: usize, s: usize, centre: bool, w: &mut Vec<f3
 
 #[cfg(test)]
 mod tests {
+    /// Q10's oracle: the one-buffer windows are the per-window vectors, bit
+    /// for bit, in every mode, with frames skipped and a partial last
+    /// window dropped.
+    #[test]
+    fn flat_windows_are_the_windows() {
+        use rusty_esp_signal_core::esp_core::Micros;
+        use rusty_esp_signal_core::radar::csi_stream::TAG_LLTF_20MHZ;
+        let samples: Vec<Sample> = (0..157u64)
+            .map(|k| {
+                let mut iq = [0i8; 128];
+                for e in 0..64 {
+                    iq[2 * e] = 20 + ((k as usize * 7 + e * 3) % 11) as i8;
+                    iq[2 * e + 1] = ((k as usize + e) % 5) as i8;
+                }
+                Sample::from_iq(Micros(k * 20_000), -40, 6, TAG_LLTF_20MHZ, &iq).unwrap()
+            })
+            .collect();
+        for (wander, centre) in [(true, true), (false, true), (false, false)] {
+            let cfg = super::WindowConfig {
+                frames: 10,
+                centre,
+                wander,
+            };
+            let a = super::windows(&samples, cfg);
+            let b = super::windows_flat(&samples, cfg);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(b.count, a.data.len());
+            assert_eq!((b.subcarriers, b.skipped), (a.subcarriers, a.skipped));
+            assert_eq!(b.data.len(), b.count * b.width);
+            for (x, y) in a.data.iter().zip(b.rows()) {
+                assert_eq!(bits(x), bits(y), "wander {wander} centre {centre}");
+            }
+        }
+    }
+
     /// C10's probe: `flatten` as it was (the window zero-filled, then
     /// written) against the single write, at the raw benchmark's window
     /// size, over as many windows as the benchmark cuts. Timing, best of N;

@@ -316,15 +316,17 @@ fn fit(args: &mut Args) -> Result<(), String> {
             jobs.push((idx, label, f));
         }
     }
-    let read: Vec<Result<(usize, window::Windows), String>> = jobs
+    // Each file's windows in one buffer (a heap vector per window before);
+    // the training set then borrows their rows.
+    let read: Vec<Result<(usize, window::FlatWindows), String>> = jobs
         .par_iter()
         .map(|&(_, _, f)| {
             let c = capture::read(&PathBuf::from(f), layout, bench::FRAME_US)
                 .map_err(|e| format!("{f}: {e}"))?;
-            Ok((c.rejected, window::windows(&c.samples, win)))
+            Ok((c.rejected, window::windows_flat(&c.samples, win)))
         })
         .collect();
-    let mut data = Vec::new();
+    let mut files = Vec::with_capacity(read.len());
     let mut targets = Vec::new();
     let mut subcarriers = 0usize;
     for (&(idx, label, f), r) in jobs.iter().zip(read) {
@@ -340,14 +342,17 @@ fn fit(args: &mut Args) -> Result<(), String> {
         }
         eprintln!(
             "{label}: {f}: {} windows ({rejected} rows refused, {} frames skipped)",
-            w.data.len(),
-            w.skipped
+            w.count, w.skipped
         );
-        targets.extend(std::iter::repeat_n(idx, w.data.len()));
-        data.extend(w.data);
+        targets.extend(std::iter::repeat_n(idx, w.count));
+        files.push(w);
     }
     if let Some(e) = bad_spec {
         return Err(e);
+    }
+    let mut data: Vec<&[f32]> = Vec::with_capacity(targets.len());
+    for w in &files {
+        data.extend(w.rows());
     }
     let model =
         Model::fit(&data, &targets, labels, subcarriers, win, cfg).map_err(|e| e.to_string())?;
