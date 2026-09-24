@@ -178,6 +178,18 @@ impl Model {
     ///
     /// [`crate::Error::Input`] when a window has the wrong width.
     pub fn scores<R: AsRef<[f32]>>(&self, data: &[R]) -> crate::Result<Vec<Vec<f32>>> {
+        let k = self.ridge.outputs.max(1);
+        Ok(self
+            .scores_flat(data)?
+            .chunks(k)
+            .map(<[f32]>::to_vec)
+            .collect())
+    }
+
+    /// [`Model::scores`], row-major in one buffer (`windows × labels`): what
+    /// a caller that only compares scores wants, without a vector per
+    /// window.
+    fn scores_flat<R: AsRef<[f32]>>(&self, data: &[R]) -> crate::Result<Vec<f32>> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
@@ -185,7 +197,7 @@ impl Model {
         let phi = Self::encode_with(&self.input, self.encoder.as_ref(), &x)?;
         let y = self.ridge.predict(&phi)?;
         let _g = prof::scope(Stage::Predict);
-        Ok(y.to_vec2()?)
+        Ok(y.flatten_all()?.to_vec1()?)
     }
 
     /// The label index each window reads as.
@@ -194,10 +206,10 @@ impl Model {
     ///
     /// As [`Model::scores`].
     pub fn classify<R: AsRef<[f32]>>(&self, data: &[R]) -> crate::Result<Vec<usize>> {
-        let scores = self.scores(data)?;
+        let scores = self.scores_flat(data)?;
         let _g = prof::scope(Stage::Classify);
         Ok(scores
-            .iter()
+            .chunks(self.ridge.outputs.max(1))
             .map(|s| {
                 s.iter()
                     .enumerate()
