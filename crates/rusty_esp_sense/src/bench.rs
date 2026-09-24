@@ -347,10 +347,12 @@ fn called_occupied(model: &Model, captures: &[&Prepared]) -> crate::Result<Vec<V
         .iter()
         .position(|l| l == "occupied")
         .ok_or_else(|| crate::Error::Model("no `occupied` label".into()))?;
-    let rows: Vec<&[f32]> = captures
-        .iter()
-        .flat_map(|p| p.windows.iter().map(Vec::as_slice))
-        .collect();
+    // Sized once: a flattening iterator's size hint starts at zero, so
+    // collecting it grew the list by doubling.
+    let mut rows: Vec<&[f32]> = Vec::with_capacity(captures.iter().map(|p| p.windows.len()).sum());
+    for p in captures {
+        rows.extend(p.windows.iter().map(Vec::as_slice));
+    }
     let calls = model.classify(&rows)?;
     let mut out = Vec::with_capacity(captures.len());
     let mut at = 0;
