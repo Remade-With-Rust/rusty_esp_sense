@@ -162,12 +162,25 @@ pub fn run(recordings: &[Recording], burst: Option<u16>) -> FallReport {
             .collect();
         values.sort_unstable();
         values.dedup();
+        // A stream can raise an event at threshold `b` only if one of its
+        // frames reaches `b` (the burst comparison is the only way into an
+        // event), so a stream whose peak is below `b` is skipped for it --
+        // exactly, not heuristically. The empty and traffic captures, which
+        // peak far below any candidate, are never run at all.
+        let peaks: Vec<u16> = test
+            .iter()
+            .map(|(_, st)| st.iter().map(|&(_, w)| w).max().unwrap_or(0))
+            .collect();
         for &b in values.iter().rev() {
             let c = FallConfig {
                 burst_permille: b,
                 ..config
             };
-            if test.iter().any(|(_, st)| events(st, c) > 0) {
+            if test
+                .iter()
+                .zip(&peaks)
+                .any(|((_, st), &peak)| peak >= b && events(st, c) > 0)
+            {
                 first_false_at = b;
                 break;
             }
