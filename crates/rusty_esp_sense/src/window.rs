@@ -95,6 +95,9 @@ pub struct WindowBuilder {
     /// Frames in `frames`.
     filled: usize,
     skipped: usize,
+    /// `wander`'s per-subcarrier means, reused for every window: it was a
+    /// heap vector per window.
+    mean: Vec<f32>,
 }
 
 impl WindowBuilder {
@@ -107,6 +110,7 @@ impl WindowBuilder {
             frames: Vec::new(),
             filled: 0,
             skipped: 0,
+            mean: Vec::new(),
         }
     }
 
@@ -151,7 +155,7 @@ impl WindowBuilder {
         }
         prof::add(Counter::Windows, 1);
         let w = if self.cfg.wander {
-            wander(&self.frames, t, self.subcarriers)
+            wander(&self.frames, t, self.subcarriers, &mut self.mean)
         } else {
             flatten(&self.frames, t, self.subcarriers, self.cfg.centre)
         };
@@ -191,18 +195,20 @@ pub fn windows(samples: &[Sample], cfg: WindowConfig) -> Windows {
 /// floats at, so the result is bit for bit the per-subcarrier loops it
 /// replaced -- which walked down the buffer with a stride of `s`.
 #[inline(never)]
-fn wander(frames: &[f32], t: usize, s: usize) -> Vec<f32> {
+fn wander(frames: &[f32], t: usize, s: usize, mean: &mut Vec<f32>) -> Vec<f32> {
     let tf = t as f32;
-    let mut mean = vec![-0.0f32; s];
+    // The caller's scratch, reset to the same starting values each window.
+    mean.clear();
+    mean.resize(s, -0.0);
     for row in frames.chunks_exact(s).take(t) {
-        add_row(&mut mean, row);
+        add_row(mean, row);
     }
-    for m in &mut mean {
+    for m in mean.iter_mut() {
         *m /= tf;
     }
     let mut var = vec![-0.0f32; s];
     for row in frames.chunks_exact(s).take(t) {
-        add_squared_deviations(&mut var, row, &mean);
+        add_squared_deviations(&mut var, row, mean);
     }
     for v in &mut var {
         *v = (*v / tf).sqrt();
@@ -415,7 +421,7 @@ mod tests {
                 .collect();
             let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             assert_eq!(
-                bits(&wander(&frames, t, s)),
+                bits(&wander(&frames, t, s, &mut Vec::new())),
                 bits(&reference(&frames, t, s)),
                 "t {t} s {s}"
             );
