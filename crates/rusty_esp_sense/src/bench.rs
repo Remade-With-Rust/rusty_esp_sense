@@ -322,13 +322,13 @@ struct Flat {
 /// call at the end of each window -- in ONE pass. Each frame's features are
 /// computed and normalised once and handed to both; they were computed
 /// twice before (docs/PERF.md).
-fn prepare(c: &Capture, cfg: WindowConfig) -> (Flat, Vec<bool>) {
+fn prepare(c: &Capture, cfg: WindowConfig, b: &mut WindowBuilder) -> (Flat, Vec<bool>) {
     let _g = prof::scope(Stage::Window);
     prof::add(Counter::DetectorPushes, c.samples.len() as u64);
     prof::add(Counter::FeatureComputations, c.samples.len() as u64);
     let frames = cfg.frames.max(1);
     let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
-    let mut b = WindowBuilder::new(cfg);
+    b.reset();
     // A window takes exactly `frames` frames and a call is made every
     // `frames` frames, so there are at most samples / frames of each: sized
     // once, not grown by doubling (a fresh allocation and a copy each time).
@@ -490,9 +490,24 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
     // Each recording's windows and detector calls depend on that recording
     // alone: prepared in parallel, collected in order. The checks and the
     // fold numbering below still run over them in recording order.
+    // One window builder per pool thread, its frame buffer and scratch
+    // reused recording after recording: one contiguous run of recordings
+    // per thread, each run prepared in order, the runs joined in order.
+    let per = recordings
+        .len()
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(1);
     let windowed: Vec<(Flat, Vec<bool>)> = recordings
-        .par_iter()
-        .map(|r| prepare(&r.capture, cfg.window))
+        .par_chunks(per)
+        .map(|run| {
+            let mut b = WindowBuilder::new(cfg.window);
+            run.iter()
+                .map(|r| prepare(&r.capture, cfg.window, &mut b))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
         .collect();
     for (r, (w, detector)) in recordings.iter().zip(windowed) {
         if subcarriers == 0 {

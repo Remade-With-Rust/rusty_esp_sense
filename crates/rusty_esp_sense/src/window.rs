@@ -114,6 +114,16 @@ impl WindowBuilder {
         }
     }
 
+    /// Start a new run: as [`WindowBuilder::new`] with the same config,
+    /// but the frame buffer and the scratch are kept, so a caller cutting
+    /// many recordings allocates them once, not once per recording.
+    pub fn reset(&mut self) {
+        self.subcarriers = 0;
+        self.frames.clear();
+        self.filled = 0;
+        self.skipped = 0;
+    }
+
     /// Subcarriers per frame, set by the first frame that had any.
     #[must_use]
     pub const fn subcarriers(&self) -> usize {
