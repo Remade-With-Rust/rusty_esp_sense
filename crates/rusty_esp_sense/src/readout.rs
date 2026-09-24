@@ -68,22 +68,6 @@ impl Standardize {
         Ok(Tensor::from_vec(v, (rows.len(), d), &Device::Cpu)?)
     }
 
-    /// [`Standardize::fit`] and then [`Standardize::apply`] to the same
-    /// `x`: the input copied out once, and standardised in place while the
-    /// copy is fresh, where the two calls copied it out twice.
-    ///
-    /// # Errors
-    ///
-    /// A tensor error when `x` is not two-dimensional.
-    pub fn fit_apply(x: &Tensor) -> crate::Result<(Self, Tensor)> {
-        let _g = prof::scope(Stage::InputStd);
-        let (n, d) = x.dims2()?;
-        let mut v: Vec<f32> = x.to_dtype(DType::F32)?.flatten_all()?.to_vec1()?;
-        let norm = Self::of(v.chunks_exact(d.max(1)), d);
-        norm.apply_in_place(&mut v);
-        Ok((norm, Tensor::from_vec(v, (n, d), &Device::Cpu)?))
-    }
-
     /// The statistics of `rows`, each `d` wide, in order.
     fn of<'a, I: Iterator<Item = &'a [f32]> + Clone>(rows: I, d: usize) -> Self {
         // Column sums in f64, row by row, streamed from the f32 values: no
@@ -147,6 +131,18 @@ impl Standardize {
     }
 }
 
+/// Append `(row[c] - mean[c]) / std[c]` in f32, widened to f64 -- exactly
+/// what standardising in f32 and then converting the tensor gave.
+#[inline(never)]
+fn extend_standardized_f64(out: &mut Vec<f64>, row: &[f32], mean: &[f32], std: &[f32]) {
+    out.extend(
+        row.iter()
+            .zip(mean)
+            .zip(std)
+            .map(|((&e, &m), &s)| f64::from((e - m) / s)),
+    );
+}
+
 /// `acc[c] += row[c] as f64`, every column's accumulator side by side --
 /// each still summed over rows in order. Its own frame so the slices arrive
 /// as non-aliasing parameters and the loop vectorises; inlined into
@@ -196,10 +192,22 @@ impl Ridge {
                 y.len()
             )));
         }
-        let (norm, z32) = Standardize::fit_apply(phi)?;
-        let z = z32.to_dtype(DType::F64)?;
-        // A shadowing `let` would keep the f32 copy alive through the fit.
-        drop(z32);
+        // Statistics from the features where they lie, then each value
+        // standardised in f32 and widened straight into the f64 buffer the
+        // Gram reads: no f32 copy, no second f32 pass, no conversion pass.
+        let (norm, z) = crate::host::with_f32(phi, |v| {
+            let norm = {
+                let _g = prof::scope(Stage::InputStd);
+                Standardize::of(v.chunks_exact(d.max(1)), d)
+            };
+            let _g = prof::scope(Stage::RidgeStd);
+            let mut z: Vec<f64> = Vec::with_capacity(v.len());
+            for row in v.chunks_exact(d.max(1)) {
+                extend_standardized_f64(&mut z, row, &norm.mean, &norm.std);
+            }
+            (norm, z)
+        })?;
+        let z = Tensor::from_vec(z, (n, d), &Device::Cpu)?;
         let intercept: Vec<f64> = (0..outputs)
             .map(|j| (0..n).map(|i| f64::from(y[i * outputs + j])).sum::<f64>() / n as f64)
             .collect();
