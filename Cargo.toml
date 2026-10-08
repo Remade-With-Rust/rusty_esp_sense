@@ -19,10 +19,10 @@ missing_docs = "warn"
 # Siblings in the Janus family are consumed BY GIT URL so this repo deploys on
 # its own; inside the umbrella, `.cargo/config.toml` patches them to the
 # checkouts.
-rusty_esp_signal-core = { git = "https://github.com/Remade-With-Rust/rusty_esp_signal", branch = "w7/fall", version = "0.2", default-features = false }
+rusty_esp_signal-core = { version = "0.3", default-features = false }
 # The live subscriber only (feature `live`): the W5 stream's decoder and the
 # iroh client that subscribes to it.
-rusty_esp_iroh-host = { git = "https://github.com/Remade-With-Rust/rusty_esp_iroh", branch = "w5/csi-stream", version = "0.1", default-features = false }
+rusty_esp_iroh-host = { version = "0.1", default-features = false }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 
 # The tensor spine (house rule: candle for every non-LLM model). CPU only:

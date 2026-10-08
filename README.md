@@ -135,6 +135,37 @@ The library never chooses an allocator.
 four minutes without traffic, it called 13 of 60 windows of a 10 Mbps
 capture occupied.
 
+## Sibling dependencies
+
+Two rules, both paid for on 2026-10-08, when this repo turned out to have
+been unbuildable by anyone without a local Janus checkout for weeks while
+CI stayed green.
+
+**A committed manifest names a PUBLISHED version, never a git branch.** A
+git source offers exactly one version -- whatever is on that branch today --
+so `{ git = "...", version = "0.2" }` with no revision pinned silently stops
+resolving the moment the sibling releases 0.3. That is what happened:
+`rusty_esp_iroh-host`'s own manifest asked for `rusty_esp_signal-core
+= "^0.2"` while the signal repo had moved to 0.3.0, and nothing anywhere
+could satisfy both. Where a revision really is needed, pin the **rev**, not
+the branch.
+
+**In-flight sibling work belongs in the gitignored `.cargo/config.toml`,
+not in the manifest.** That is the umbrella's convention (see its
+`.cargo/config.toml`) and it is why the breakage hid: the local patch
+overrode the git coordinates on every developer machine, so the manifest's
+dependency was dead text that only CI and outsiders ever tried to resolve.
+Patch on `[patch.crates-io]` now that the manifest names published versions.
+
+`--features live` needs `rusty_esp_iroh-host`'s `csi` and `core::telemetry`,
+which are not in the published 0.1.0 -- they are on rusty_esp_iroh's
+`w5/csi-stream` branch. The default binary, which is what CI builds and what
+`docs/PERF.md` measures, needs none of it.
+
+The `resolve without the lock` CI job exists to keep both rules honest:
+every other job resolves from the committed lock and so cannot see this
+class of drift at all.
+
 ## Where it runs
 
 On the home computer or any LAN box — not on the device. It reads what the

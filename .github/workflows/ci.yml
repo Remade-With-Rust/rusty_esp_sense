@@ -29,6 +29,26 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # The rule this repo learned the hard way (2026-10-08): every other job
+  # resolves from the committed Cargo.lock, so a sibling repo releasing a new
+  # MINOR cannot break them -- the breakage waits, invisible, until someone
+  # edits a manifest and forces a re-resolve. It waited weeks here, and the
+  # repo was unbuildable by anyone without a local checkout the whole time.
+  #
+  # This job throws the lock away and resolves from scratch, so that drift
+  # surfaces on the day it happens. It does not build: resolution is the
+  # whole question, and `cargo metadata` answers it in seconds.
+  resolve:
+    name: resolve without the lock
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: resolve from scratch
+        run: |
+          rm -f Cargo.lock
+          cargo metadata --format-version 1 > /dev/null
+
   deny:
     name: cargo deny
     runs-on: ubuntu-latest
