@@ -37,8 +37,12 @@ use rusty_esp_signal_core::radar::csi::{Config as DetectorConfig, PresenceDetect
 use rusty_esp_signal_core::radar::csi_stream::TAG_C6_HT20_NATURAL;
 
 use crate::capture::{self, Capture};
+use crate::encoder::RandomFeatures;
 use crate::model::{FitConfig, Model};
-use crate::window::{self, WindowConfig};
+use crate::prof::{self, Counter, Stage};
+use crate::readout::{Ridge, Standardize};
+use crate::window::{WindowBuilder, WindowConfig};
+use rayon::prelude::*;
 
 /// The dataset's frame interval: 50 Hz.
 pub const FRAME_US: u64 = 20_000;
@@ -119,7 +123,11 @@ pub struct Recording {
 /// [`crate::Error::Io`] when a folder or file cannot be read;
 /// [`crate::Error::Input`] when no capture was found.
 pub fn load(root: &Path) -> crate::Result<Vec<Recording>> {
-    let mut out = Vec::new();
+    // The folder walk names the files; the files then parse in parallel,
+    // one per task. Each parse is a pure function of its file, the results
+    // come back in walk order, and the first failure in walk order is the
+    // one returned -- as the sequential loop returned it.
+    let mut found = Vec::new();
     for dir in std::fs::read_dir(root)? {
         let dir = dir?.path();
         if !dir.is_dir() {
@@ -141,13 +149,39 @@ pub fn load(root: &Path) -> crate::Result<Vec<Recording>> {
                 continue;
             };
             let day = rest.split('_').nth(1).unwrap_or("").to_owned();
-            let capture = capture::read(&path, TAG_C6_HT20_NATURAL, FRAME_US)?;
-            out.push(Recording {
-                scenario,
-                day,
-                capture,
-            });
+            found.push((path, scenario, day));
         }
+    }
+    // One read buffer per thread, reused file after file: the bytes are
+    // only parsed, and a fresh 1.2 MB buffer per file cost its first-touch
+    // page faults every time. The files are split into one contiguous run
+    // per pool thread (map_init made a buffer per work-stealing split, 27
+    // at one thread), each run parsed in order, the runs joined in order.
+    let per = found
+        .len()
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(1);
+    let parsed: Vec<crate::Result<Recording>> = found
+        .par_chunks_mut(per)
+        .map(|run| {
+            let mut buf = Vec::new();
+            run.iter_mut()
+                .map(|(path, scenario, day)| {
+                    Ok(Recording {
+                        scenario: *scenario,
+                        day: core::mem::take(day),
+                        capture: capture::read_into(path, &mut buf, TAG_C6_HT20_NATURAL, FRAME_US)?,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect();
+    let mut out = Vec::with_capacity(parsed.len());
+    for r in parsed {
+        out.push(r?);
     }
     if out.is_empty() {
         return Err(crate::Error::Input(format!(
@@ -168,6 +202,10 @@ pub struct BenchConfig {
     pub fit: FitConfig,
     /// Folds of whole captures.
     pub folds: usize,
+    /// Fits run at once (the folds and the confound); 0 runs them all at
+    /// once. Each holds its training set, features and Gram matrix while it
+    /// runs, so this bounds peak memory; the results do not depend on it.
+    pub fit_jobs: usize,
 }
 
 impl Default for BenchConfig {
@@ -176,6 +214,7 @@ impl Default for BenchConfig {
             window: WindowConfig::DEFAULT,
             fit: FitConfig::DEFAULT,
             folds: 5,
+            fit_jobs: 0,
         }
     }
 }
@@ -258,32 +297,82 @@ pub struct Report {
 struct Prepared {
     scenario: Scenario,
     fold: usize,
-    windows: Vec<Vec<f32>>,
+    /// Every window of the capture in one buffer, `width` values each: a
+    /// heap vector per window before.
+    windows: Vec<f32>,
+    width: usize,
+    count: usize,
     detector: Vec<bool>,
 }
 
-fn detector_calls(c: &Capture, frames: usize) -> Vec<bool> {
-    let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
-    let mut calls = Vec::new();
-    let mut seen = 0usize;
-    for s in &c.samples {
-        let Ok(f) = s.features() else { continue };
-        let verdict = det.push(&f.normalised(), Micros(s.at.0));
-        seen += 1;
-        if seen % frames.max(1) == 0 {
-            calls.push(matches!(verdict, Verdict::Present { .. }));
-        }
+impl Prepared {
+    fn rows(&self) -> core::slice::ChunksExact<'_, f32> {
+        self.windows.chunks_exact(self.width.max(1))
     }
-    calls
 }
 
-fn table(rows: &[(Scenario, Vec<bool>)]) -> Table {
+/// A capture's windows in one buffer.
+struct Flat {
+    subcarriers: usize,
+    data: Vec<f32>,
+    count: usize,
+}
+
+/// A capture's windows and, over the same frames, the on-chip detector's
+/// call at the end of each window -- in ONE pass. Each frame's features are
+/// computed and normalised once and handed to both; they were computed
+/// twice before (docs/PERF.md).
+fn prepare(c: &Capture, cfg: WindowConfig, b: &mut WindowBuilder) -> (Flat, Vec<bool>) {
+    let _g = prof::scope(Stage::Window);
+    prof::add(Counter::DetectorPushes, c.samples.len() as u64);
+    prof::add(Counter::FeatureComputations, c.samples.len() as u64);
+    let frames = cfg.frames.max(1);
+    let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
+    b.reset();
+    // A window takes exactly `frames` frames and a call is made every
+    // `frames` frames, so there are at most samples / frames of each: sized
+    // once, not grown by doubling (a fresh allocation and a copy each time).
+    let most = c.samples.len() / frames;
+    let mut data: Vec<f32> = Vec::new();
+    let mut count = 0usize;
+    let mut calls = Vec::with_capacity(most);
+    let mut seen = 0usize;
+    for s in &c.samples {
+        let norm = s.features().ok().map(|f| f.normalised());
+        if data.capacity() == 0 {
+            if let Some(f) = &norm {
+                // The width is known from the first frame: every window of
+                // the capture fits in one buffer, sized once.
+                data.reserve_exact(most * cfg.width(f.amplitudes().len()));
+            }
+        }
+        if b.push_into(norm.as_ref(), &mut data) {
+            count += 1;
+        }
+        if let Some(f) = &norm {
+            let verdict = det.push(f, Micros(s.at.0));
+            seen += 1;
+            if seen % frames == 0 {
+                calls.push(matches!(verdict, Verdict::Present { .. }));
+            }
+        }
+    }
+    calls.truncate(count);
+    let w = Flat {
+        subcarriers: b.subcarriers(),
+        data,
+        count,
+    };
+    (w, calls)
+}
+
+fn table<C: AsRef<[bool]>>(rows: &[(Scenario, C)]) -> Table {
     Scenario::ALL
         .iter()
         .map(|&s| {
             let mut t = Tally::default();
             for (_, calls) in rows.iter().filter(|(r, _)| *r == s) {
-                t.add(calls);
+                t.add(calls.as_ref());
             }
             (s, t)
         })
@@ -291,36 +380,99 @@ fn table(rows: &[(Scenario, Vec<bool>)]) -> Table {
         .collect()
 }
 
-fn called_occupied(model: &Model, windows: &[Vec<f32>]) -> crate::Result<Vec<bool>> {
+/// Every capture's calls, from ONE scoring pass over all their windows:
+/// scored one capture at a time, each call rebuilt the standardisation and
+/// readout tensors for the same model. Each window's scores are its own
+/// row's, so the split back per capture is exact.
+fn called_occupied(model: &Model, captures: &[&Prepared]) -> crate::Result<Vec<Vec<bool>>> {
     let occupied = model
         .labels
         .iter()
         .position(|l| l == "occupied")
         .ok_or_else(|| crate::Error::Model("no `occupied` label".into()))?;
-    Ok(model
-        .classify(windows)?
-        .into_iter()
-        .map(|c| c == occupied)
-        .collect())
+    // Sized once: a flattening iterator's size hint starts at zero, so
+    // collecting it grew the list by doubling.
+    let mut rows: Vec<&[f32]> = Vec::with_capacity(captures.iter().map(|p| p.count).sum());
+    for p in captures {
+        rows.extend(p.rows());
+    }
+    let calls = model.classify(&rows)?;
+    let mut out = Vec::with_capacity(captures.len());
+    let mut at = 0;
+    for p in captures {
+        let n = p.count;
+        out.push(calls[at..at + n].iter().map(|&c| c == occupied).collect());
+        at += n;
+    }
+    Ok(out)
 }
 
-fn fit_on(prepared: &[&Prepared], subcarriers: usize, cfg: &BenchConfig) -> crate::Result<Model> {
-    let mut data = Vec::new();
-    let mut targets = Vec::new();
-    for p in prepared {
-        for w in &p.windows {
-            data.push(w.clone());
-            targets.push(usize::from(p.scenario.occupied()));
+/// Per capture scored, its scenario and its window-by-window calls.
+type Calls = Vec<(Scenario, Vec<bool>)>;
+
+fn fit_on(
+    prepared: &[&Prepared],
+    subcarriers: usize,
+    cfg: &BenchConfig,
+    encoder: Option<&RandomFeatures>,
+) -> crate::Result<Model> {
+    let (data, targets) = {
+        let _g = prof::scope(Stage::Gather);
+        // Sized once from the captures' window counts: grown by doubling,
+        // the two lists reallocated and copied about a dozen times per fit.
+        let n: usize = prepared.iter().map(|p| p.count).sum();
+        let mut data = Vec::with_capacity(n);
+        let mut targets = Vec::with_capacity(n);
+        for p in prepared {
+            // Borrowed, not cloned: the fit copies each row once, into the
+            // tensor it stacks.
+            for w in p.rows() {
+                data.push(w);
+                targets.push(usize::from(p.scenario.occupied()));
+            }
         }
-    }
-    Model::fit(
+        (data, targets)
+    };
+    Model::fit_with(
         &data,
         &targets,
         vec!["empty".into(), "occupied".into()],
         subcarriers,
         cfg.window,
         cfg.fit,
+        encoder,
     )
+}
+
+/// A zero-valued model with exactly the shapes a fit with `cfg` produces.
+fn shaped_like(subcarriers: usize, cfg: &BenchConfig, encoder: Option<&RandomFeatures>) -> Model {
+    let width = cfg.window.width(subcarriers);
+    let d = if cfg.fit.features > 0 {
+        cfg.fit.features
+    } else {
+        width
+    };
+    let outputs = 2;
+    let zeros = |n: usize| vec![0f32; n];
+    Model {
+        window: cfg.window,
+        subcarriers,
+        input: Standardize {
+            mean: zeros(width),
+            std: zeros(width),
+        },
+        encoder: encoder.cloned(),
+        ridge: Ridge {
+            norm: Standardize {
+                mean: zeros(d),
+                std: zeros(d),
+            },
+            beta: zeros(d * outputs),
+            intercept: zeros(outputs),
+            outputs,
+        },
+        labels: vec!["empty".into(), "occupied".into()],
+    }
 }
 
 /// Run the benchmark over `recordings`.
@@ -335,8 +487,29 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
     let mut prepared = Vec::with_capacity(recordings.len());
     let mut per_scenario = [0usize; 4];
     let mut counts = Vec::new();
-    for r in recordings {
-        let w = window::windows(&r.capture.samples, cfg.window);
+    // Each recording's windows and detector calls depend on that recording
+    // alone: prepared in parallel, collected in order. The checks and the
+    // fold numbering below still run over them in recording order.
+    // One window builder per pool thread, its frame buffer and scratch
+    // reused recording after recording: one contiguous run of recordings
+    // per thread, each run prepared in order, the runs joined in order.
+    let per = recordings
+        .len()
+        .div_ceil(rayon::current_num_threads().max(1))
+        .max(1);
+    let windowed: Vec<(Flat, Vec<bool>)> = recordings
+        .par_chunks(per)
+        .map(|run| {
+            let mut b = WindowBuilder::new(cfg.window);
+            run.iter()
+                .map(|r| prepare(&r.capture, cfg.window, &mut b))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
+        .collect();
+    for (r, (w, detector)) in recordings.iter().zip(windowed) {
         if subcarriers == 0 {
             subcarriers = w.subcarriers;
         }
@@ -352,50 +525,90 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
             .unwrap_or(0);
         let fold = per_scenario[idx] % folds;
         per_scenario[idx] += 1;
-        let mut detector = detector_calls(&r.capture, cfg.window.frames);
-        detector.truncate(w.data.len());
-        counts.push(w.data.len());
+        counts.push(w.count);
         prepared.push(Prepared {
             scenario: r.scenario,
             fold,
             windows: w.data,
+            width: cfg.window.width(subcarriers),
+            count: w.count,
             detector,
         });
     }
 
-    // Held out, fold by fold.
-    let mut held = Vec::new();
+    // One encoder for every fit below: it depends on the seed and the widths
+    // only, and was generated seven times before (docs/PERF.md).
+    let encoder = if cfg.fit.features > 0 {
+        Some(RandomFeatures::new(
+            cfg.fit.seed,
+            cfg.window.width(subcarriers),
+            cfg.fit.features,
+        )?)
+    } else {
+        None
+    };
+
+    // Held out, fold by fold, and the confound (fit on E1 + E2 only, scored
+    // on E3 + E4). Every one of these fits is independent -- its own
+    // training rows, its own model, the one shared encoder only read -- so
+    // they run on rayon's pool together (the multiplies inside them share
+    // the same pool). Results are kept per job and concatenated in job
+    // order, the confound last, so the tables are built exactly as the
+    // sequential loop built them and the first failure in that order is
+    // the one returned.
+    let mut jobs: Vec<(bool, Vec<&Prepared>, Vec<&Prepared>)> = Vec::new();
     for f in 0..folds {
         let train: Vec<&Prepared> = prepared.iter().filter(|p| p.fold != f).collect();
         let test: Vec<&Prepared> = prepared.iter().filter(|p| p.fold == f).collect();
-        if test.is_empty() {
-            continue;
-        }
-        let model = fit_on(&train, subcarriers, cfg)?;
-        for p in test {
-            held.push((p.scenario, called_occupied(&model, &p.windows)?));
+        if !test.is_empty() {
+            jobs.push((false, train, test));
         }
     }
-
-    // The confound: E1 + E2 only.
     let e12: Vec<&Prepared> = prepared
         .iter()
         .filter(|p| matches!(p.scenario, Scenario::Baseline | Scenario::Walking))
         .collect();
-    let mut confound = Vec::new();
     if !e12.is_empty() {
-        let model = fit_on(&e12, subcarriers, cfg)?;
-        for p in prepared
+        let later: Vec<&Prepared> = prepared
             .iter()
             .filter(|p| matches!(p.scenario, Scenario::Traffic | Scenario::Coexistence))
-        {
-            confound.push((p.scenario, called_occupied(&model, &p.windows)?));
+            .collect();
+        jobs.push((true, e12, later));
+    }
+    let at_once = if cfg.fit_jobs == 0 {
+        jobs.len().max(1)
+    } else {
+        cfg.fit_jobs
+    };
+    let mut scored: Vec<crate::Result<(bool, Calls)>> = Vec::with_capacity(jobs.len());
+    for batch in jobs.chunks(at_once) {
+        scored.par_extend(batch.par_iter().map(|(confound, train, test)| {
+            let model = fit_on(train, subcarriers, cfg, encoder.as_ref())?;
+            let calls = called_occupied(&model, test)?;
+            let rows = test
+                .iter()
+                .zip(calls)
+                .map(|(p, c)| (p.scenario, c))
+                .collect();
+            Ok((*confound, rows))
+        }));
+    }
+    let mut held = Vec::new();
+    let mut confound = Vec::new();
+    for r in scored {
+        let (is_confound, rows) = r?;
+        if is_confound {
+            confound.extend(rows);
+        } else {
+            held.extend(rows);
         }
     }
 
-    // A model calibrated on everything: its file's size.
-    let all: Vec<&Prepared> = prepared.iter().collect();
-    let model = fit_on(&all, subcarriers, cfg)?;
+    // The size of a model file calibrated on everything. A safetensors file's
+    // size is a function of its tensors' SHAPES (the header holds shapes and
+    // offsets), never their values, so a zero-valued model of the same shape
+    // measures it without an eighth fit's Gram matrix and Cholesky solve.
+    let model = shaped_like(subcarriers, cfg, encoder.as_ref());
     let path = std::env::temp_dir().join(format!(
         "rusty_esp_sense-bench-{}.safetensors",
         std::process::id()
@@ -404,9 +617,11 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
     let model_bytes = std::fs::metadata(&path)?.len();
     let _ = std::fs::remove_file(&path);
 
-    let detector: Vec<(Scenario, Vec<bool>)> = prepared
+    // Borrowed: every recording's detector calls were cloned only to be
+    // counted.
+    let detector: Vec<(Scenario, &[bool])> = prepared
         .iter()
-        .map(|p| (p.scenario, p.detector.clone()))
+        .map(|p| (p.scenario, p.detector.as_slice()))
         .collect();
     let days = Scenario::ALL
         .iter()
@@ -436,6 +651,144 @@ pub fn run(recordings: &[Recording], cfg: &BenchConfig) -> crate::Result<Report>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Synthetic recordings for all four scenarios, through the capture
+    /// parser: occupied scenarios wobble their amplitudes, empty ones hold.
+    fn synthetic() -> Vec<Recording> {
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut out = Vec::new();
+        for (si, &scenario) in Scenario::ALL.iter().enumerate() {
+            for c in 0..5 {
+                let mut text = String::new();
+                for _ in 0..120 {
+                    text.push_str("CSI_DATA,-40,128");
+                    for k in 0..128 {
+                        let v = if k % 2 == 0 {
+                            let wobble = if scenario.occupied() {
+                                next() % 13
+                            } else {
+                                next() % 2
+                            };
+                            20 + (k % 7) as i64 + wobble as i64
+                        } else {
+                            0
+                        };
+                        text.push_str(&format!(",{v}"));
+                    }
+                    text.push('\n');
+                }
+                out.push(Recording {
+                    scenario,
+                    day: format!("2026050{si}"),
+                    capture: capture::parse(
+                        &format!("s{si}c{c}"),
+                        &text,
+                        TAG_C6_HT20_NATURAL,
+                        FRAME_US,
+                    ),
+                });
+            }
+        }
+        out
+    }
+
+    /// The parallel benchmark's report does not depend on how many fits run
+    /// at once, nor on the pool's size: every job's result is kept apart and
+    /// concatenated in job order.
+    #[test]
+    fn the_report_does_not_depend_on_fit_jobs_or_threads() {
+        let recs = synthetic();
+        let cfg = |fit_jobs| BenchConfig {
+            window: WindowConfig {
+                frames: 10,
+                centre: true,
+                wander: true,
+            },
+            fit: FitConfig {
+                features: 16,
+                ..FitConfig::DEFAULT
+            },
+            folds: 5,
+            fit_jobs,
+        };
+        let report = |threads: usize, fit_jobs: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            pool.install(|| format!("{:?}", run(&recs, &cfg(fit_jobs)).unwrap()))
+        };
+        let want = report(1, 1);
+        assert!(want.contains("held_out"), "{want}");
+        for (threads, fit_jobs) in [(1, 0), (4, 0), (4, 1), (4, 2), (4, 6)] {
+            assert_eq!(
+                report(threads, fit_jobs),
+                want,
+                "threads {threads}, fit_jobs {fit_jobs}"
+            );
+        }
+    }
+
+    /// The oracle for R2: a model fitted on data and the zero-valued one of
+    /// the same shape save to files of identical size, raw window or wander,
+    /// with or without the encoder.
+    #[test]
+    fn a_fitted_model_and_its_shape_save_to_the_same_size() {
+        for (wander, features) in [(true, 64), (true, 0), (false, 32)] {
+            let window = WindowConfig {
+                frames: 10,
+                centre: true,
+                wander,
+            };
+            let cfg = BenchConfig {
+                window,
+                fit: FitConfig {
+                    features,
+                    ..FitConfig::DEFAULT
+                },
+                folds: 5,
+                fit_jobs: 0,
+            };
+            let s = 6;
+            let w = window.width(s);
+            let data: Vec<Vec<f32>> = (0..20)
+                .map(|i| {
+                    (0..w)
+                        .map(|j| ((i * 7 + j * 3) % 11) as f32 * 0.01)
+                        .collect()
+                })
+                .collect();
+            let targets: Vec<usize> = (0..20).map(|i| i % 2).collect();
+            let fitted = Model::fit(
+                &data,
+                &targets,
+                vec!["empty".into(), "occupied".into()],
+                s,
+                window,
+                cfg.fit,
+            )
+            .unwrap();
+            let enc = fitted.encoder.clone();
+            let shaped = shaped_like(s, &cfg, enc.as_ref());
+            let dir = std::env::temp_dir();
+            let (a, b) = (
+                dir.join(format!("r2-fit-{wander}-{features}.st")),
+                dir.join(format!("r2-shape-{wander}-{features}.st")),
+            );
+            fitted.save(&a).unwrap();
+            shaped.save(&b).unwrap();
+            let size = |p: &std::path::Path| std::fs::metadata(p).unwrap().len();
+            assert_eq!(size(&a), size(&b), "wander {wander}, features {features}");
+            let _ = std::fs::remove_file(&a);
+            let _ = std::fs::remove_file(&b);
+        }
+    }
 
     #[test]
     fn file_names_name_their_scenario_and_the_rate_logs_are_left_out() {

@@ -11,6 +11,8 @@
 
 use candle_core::{Device, Tensor};
 
+use crate::prof::{self, Counter, Stage};
+
 /// `splitmix64`: small, fast, and fixed by its definition.
 #[derive(Debug, Clone)]
 struct SplitMix64(u64);
@@ -56,6 +58,8 @@ impl RandomFeatures {
     ///
     /// A tensor error (only on allocation failure).
     pub fn new(seed: u64, input: usize, output: usize) -> crate::Result<Self> {
+        let _g = prof::scope(Stage::EncoderGen);
+        prof::add(Counter::RandomValues, (input * output + output) as u64);
         let mut g = SplitMix64(seed);
         let scale = 1.0 / (input.max(1) as f64).sqrt();
         let w: Vec<f32> = (0..input * output)
@@ -77,7 +81,36 @@ impl RandomFeatures {
     ///
     /// A tensor error when `x` is not `[n, input]`.
     pub fn encode(&self, x: &Tensor) -> crate::Result<Tensor> {
-        Ok(x.matmul(&self.w.t()?)?.broadcast_add(&self.b)?.relu()?)
+        let _g = prof::scope(Stage::Encode);
+        prof::add(
+            Counter::EncodeMacs,
+            (x.dim(0)? * self.input * self.output) as u64,
+        );
+        // The bias and the ReLU in place over the product: the same f32 add
+        // and the same max with zero, per element, where the broadcast add
+        // and relu each built another tensor the size of the product.
+        let y = x.matmul(&self.w.t()?)?;
+        let (_, width) = y.dims2()?;
+        let b: Vec<f32> = self.b.to_vec1()?;
+        // Biased and rectified in the product's own buffer: nothing else
+        // holds this product, and writing it into a second buffer of the
+        // same size (19 MB per fold) cost that buffer's allocation and its
+        // first-touch page faults.
+        crate::host::rewrite_f32(&y, |y| {
+            for row in y.chunks_exact_mut(width.max(1)) {
+                bias_relu(row, &b);
+            }
+        })?;
+        Ok(y)
+    }
+}
+
+/// `row[j] = max(row[j] + b[j], 0)`. Its own frame so the slices arrive
+/// as non-aliasing parameters and the loop is packed.
+#[inline(never)]
+fn bias_relu(row: &mut [f32], b: &[f32]) {
+    for (e, &bias) in row.iter_mut().zip(b) {
+        *e = (*e + bias).max(0.0);
     }
 }
 

@@ -13,6 +13,7 @@ use std::path::Path;
 use candle_core::{DType, Device, Tensor};
 
 use crate::encoder::RandomFeatures;
+use crate::prof::{self, Stage};
 use crate::readout::{Ridge, Standardize};
 use crate::window::WindowConfig;
 
@@ -66,16 +67,6 @@ pub struct Model {
     pub labels: Vec<String>,
 }
 
-fn stack(data: &[Vec<f32>], width: usize) -> crate::Result<Tensor> {
-    if data.iter().any(|w| w.len() != width) {
-        return Err(crate::Error::Input(format!(
-            "a window is not {width} values wide"
-        )));
-    }
-    let flat: Vec<f32> = data.iter().flatten().copied().collect();
-    Ok(Tensor::from_vec(flat, (data.len(), width), &Device::Cpu)?)
-}
-
 impl Model {
     /// Calibrate a classifier: `data` windows (all `subcarriers ×
     /// window.frames` wide), `targets` indexes into `labels`.
@@ -84,13 +75,34 @@ impl Model {
     ///
     /// [`crate::Error::Input`] when there is nothing to fit, a target is out
     /// of range, or a window has the wrong width; a tensor error otherwise.
-    pub fn fit(
-        data: &[Vec<f32>],
+    pub fn fit<R: AsRef<[f32]>>(
+        data: &[R],
         targets: &[usize],
         labels: Vec<String>,
         subcarriers: usize,
         window: WindowConfig,
         cfg: FitConfig,
+    ) -> crate::Result<Self> {
+        Self::fit_with(data, targets, labels, subcarriers, window, cfg, None)
+    }
+
+    /// [`Model::fit`], borrowing an encoder already generated for the same
+    /// seed and widths. The encoder is a pure function of those three
+    /// numbers, so a caller fitting many models (the benchmark's folds)
+    /// generates it once; one that does not match is ignored and a fresh
+    /// one generated, so a wrong hint costs time, never correctness.
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::fit`].
+    pub fn fit_with<R: AsRef<[f32]>>(
+        data: &[R],
+        targets: &[usize],
+        labels: Vec<String>,
+        subcarriers: usize,
+        window: WindowConfig,
+        cfg: FitConfig,
+        encoder: Option<&RandomFeatures>,
     ) -> crate::Result<Self> {
         let k = labels.len();
         if data.is_empty() || data.len() != targets.len() || k < 2 {
@@ -104,18 +116,35 @@ impl Model {
             return Err(crate::Error::Input(format!("target {t} with {k} labels")));
         }
         let width = window.width(subcarriers);
-        let x = stack(data, width)?;
-        let input = Standardize::fit(&x)?;
-        let encoder = if cfg.features > 0 {
-            Some(RandomFeatures::new(cfg.seed, width, cfg.features)?)
-        } else {
-            None
+        let encoder = match encoder {
+            _ if cfg.features == 0 => None,
+            Some(e) if e.seed == cfg.seed && e.input == width && e.output == cfg.features => {
+                Some(e.clone())
+            }
+            _ => Some(RandomFeatures::new(cfg.seed, width, cfg.features)?),
         };
-        let phi = Self::encode_with(&input, encoder.as_ref(), &x)?;
-        let y: Vec<f32> = targets
-            .iter()
-            .flat_map(|&t| (0..k).map(move |j| if j == t { 1.0 } else { -1.0 }))
-            .collect();
+        // The stacked and standardised inputs live only until encoded, not
+        // through the readout's fit.
+        let (input, phi) = {
+            if data.iter().any(|w| w.as_ref().len() != width) {
+                return Err(crate::Error::Input(format!(
+                    "a window is not {width} values wide"
+                )));
+            }
+            let input = Standardize::of_rows(data, width);
+            let z = input.stack_apply(data)?;
+            let phi = match &encoder {
+                Some(e) => e.encode(&z)?,
+                None => z,
+            };
+            (input, phi)
+        };
+        // One-hot, +1 / -1, k per window: sized once (a flattening
+        // iterator's size hint starts at zero, so collecting it doubled).
+        let mut y: Vec<f32> = Vec::with_capacity(targets.len() * k);
+        for &t in targets {
+            y.extend((0..k).map(|j| if j == t { 1.0 } else { -1.0 }));
+        }
         let ridge = Ridge::fit(&phi, &y, k, cfg.alpha)?;
         Ok(Model {
             window,
@@ -127,30 +156,42 @@ impl Model {
         })
     }
 
-    fn encode_with(
-        input: &Standardize,
-        encoder: Option<&RandomFeatures>,
-        x: &Tensor,
-    ) -> crate::Result<Tensor> {
-        let z = input.apply(x)?;
-        match encoder {
-            Some(e) => e.encode(&z),
-            None => Ok(z),
-        }
-    }
-
     /// The readout's scores per window, one per label.
     ///
     /// # Errors
     ///
     /// [`crate::Error::Input`] when a window has the wrong width.
-    pub fn scores(&self, data: &[Vec<f32>]) -> crate::Result<Vec<Vec<f32>>> {
+    pub fn scores<R: AsRef<[f32]>>(&self, data: &[R]) -> crate::Result<Vec<Vec<f32>>> {
+        let k = self.ridge.outputs.max(1);
+        Ok(self
+            .scores_flat(data)?
+            .chunks(k)
+            .map(<[f32]>::to_vec)
+            .collect())
+    }
+
+    /// [`Model::scores`], row-major in one buffer (`windows × labels`): what
+    /// a caller that only compares scores wants, without a vector per
+    /// window.
+    fn scores_flat<R: AsRef<[f32]>>(&self, data: &[R]) -> crate::Result<Vec<f32>> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
-        let x = stack(data, self.window.width(self.subcarriers))?;
-        let phi = Self::encode_with(&self.input, self.encoder.as_ref(), &x)?;
-        Ok(self.ridge.predict(&phi)?.to_vec2()?)
+        let width = self.window.width(self.subcarriers);
+        if data.iter().any(|w| w.as_ref().len() != width) {
+            return Err(crate::Error::Input(format!(
+                "a window is not {width} values wide"
+            )));
+        }
+        let z = self.input.stack_apply(data)?;
+        let phi = match &self.encoder {
+            Some(e) => e.encode(&z)?,
+            None => z,
+        };
+        // The features were made here and nothing else holds them.
+        let y = self.ridge.predict_owned(phi)?;
+        let _g = prof::scope(Stage::Predict);
+        Ok(y.flatten_all()?.to_vec1()?)
     }
 
     /// The label index each window reads as.
@@ -158,10 +199,11 @@ impl Model {
     /// # Errors
     ///
     /// As [`Model::scores`].
-    pub fn classify(&self, data: &[Vec<f32>]) -> crate::Result<Vec<usize>> {
-        Ok(self
-            .scores(data)?
-            .iter()
+    pub fn classify<R: AsRef<[f32]>>(&self, data: &[R]) -> crate::Result<Vec<usize>> {
+        let scores = self.scores_flat(data)?;
+        let _g = prof::scope(Stage::Classify);
+        Ok(scores
+            .chunks(self.ridge.outputs.max(1))
             .map(|s| {
                 s.iter()
                     .enumerate()
@@ -180,6 +222,7 @@ impl Model {
     ///
     /// A tensor or I/O error.
     pub fn save(&self, path: &Path) -> crate::Result<()> {
+        let _g = prof::scope(Stage::Io);
         let dev = Device::Cpu;
         let (features, seed) = self.encoder.as_ref().map_or((0, 0), |e| (e.output, e.seed));
         let meta: Vec<i64> = vec![
@@ -223,7 +266,10 @@ impl Model {
     /// [`crate::Error::Model`] for a file that is not one of ours or a
     /// format version this build does not know; a tensor error otherwise.
     pub fn load(path: &Path) -> crate::Result<Self> {
-        let t = candle_core::safetensors::load(path, &Device::Cpu)?;
+        let t = {
+            let _g = prof::scope(Stage::Io);
+            candle_core::safetensors::load(path, &Device::Cpu)?
+        };
         let get = |k: &str| {
             t.get(k)
                 .ok_or_else(|| crate::Error::Model(format!("no `{k}` in {}", path.display())))

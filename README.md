@@ -50,6 +50,34 @@ else's bench, with a different subcarrier layout from our own devices, and
 its labels are per capture. Every number, with the run that produced it:
 [`docs/LEDGER.md`](https://github.com/Remade-With-Rust/rusty_esp_sense/blob/main/docs/LEDGER.md).
 
+## Falls and nights (W7)
+
+**A fall is a shape**: moving, a burst above anything walking does, then
+stillness that lasts. The detector is `rusty_esp_signal-core::radar::fall`
+and runs on the chip; `bench-fall` is its evidence. With its thresholds set
+on half the captures, the other half — 0.84 h of real walking, traffic and
+empty room — raised **0 false falls**, and none until the burst threshold
+was lowered from 232 ‰ to 114 ‰. On synthetic splices of real segments it
+raised 10/10 falls and 0/10 "walked out of the room". **No real fall has
+been recorded**, so no detection rate is claimed, and 0 events in 0.84 h
+bounds false alarms only below ~3.6 an hour.
+
+**A night is epochs**: 30 s each, empty / awake / asleep. Awake by
+actigraphy's rule on motion; still epochs are asleep only when a breath
+was accepted within a minute and a half, and empty otherwise — an empty
+bed and a still sleeper read the same amplitude. `bench-night` plays each
+Cuenca scenario back end to end: **0 of 122 empty-room epochs scored
+asleep** (31 empty, 91 empty with traffic), every walking epoch awake. The
+estimator accepted no breath in any of it, so the *asleep* path has not
+met real data yet, and there are no sleep stages — those need a sleep
+study to label.
+
+```sh
+rusty_esp_sense night recording.csv        # one JSON line per epoch, then a summary
+rusty_esp_sense bench-fall <dataset-dir>
+rusty_esp_sense bench-night <dataset-dir>
+```
+
 ## Why not RuView's weights
 
 RuView's released MM-Fi model takes `[3 antennas, 114 subcarriers, 10
@@ -88,15 +116,65 @@ let model = Model::fit(&w.data, &labels, vec!["empty".into(), "occupied".into()]
 model.save("room.safetensors".as_ref())?;
 ```
 
+**Threads.** Captures are parsed and windowed in parallel, and the
+benchmark fits its folds side by side. Every command takes `--threads N`;
+the default is one thread per logical CPU, or `RAYON_NUM_THREADS`. Results
+do not depend on the thread count, only time and memory do.
+`bench-cuenca --fit-jobs J` caps how many fits run at once, to bound peak
+memory: in the raw-window configuration, 664 MB with all six at once and
+264 MB one at a time.
+
+**Allocator.** The binary allocates through
+[`rusty_alloc`](https://crates.io/crates/rusty_alloc), the family's pure-Rust
+allocator. It keeps freed memory for reuse, which makes the benchmark 5-8 %
+faster and raises its peak working set, for example from 115 MB to 144 MB on
+one thread. `cargo build --no-default-features` gives the system allocator.
+The library never chooses an allocator.
+
 **Calibrate with the room's normal network traffic running.** Calibrated on
 four minutes without traffic, it called 13 of 60 windows of a 10 Mbps
 capture occupied.
+
+## Sibling dependencies
+
+Two rules, both paid for on 2026-10-08, when this repo turned out to have
+been unbuildable by anyone without a local Janus checkout for weeks while
+CI stayed green.
+
+**A committed manifest names a PUBLISHED version, never a git branch.** A
+git source offers exactly one version -- whatever is on that branch today --
+so `{ git = "...", version = "0.2" }` with no revision pinned silently stops
+resolving the moment the sibling releases 0.3. That is what happened:
+`rusty_esp_iroh-host`'s own manifest asked for `rusty_esp_signal-core
+= "^0.2"` while the signal repo had moved to 0.3.0, and nothing anywhere
+could satisfy both. Where a revision really is needed, pin the **rev**, not
+the branch.
+
+**In-flight sibling work belongs in the gitignored `.cargo/config.toml`,
+not in the manifest.** That is the umbrella's convention (see its
+`.cargo/config.toml`) and it is why the breakage hid: the local patch
+overrode the git coordinates on every developer machine, so the manifest's
+dependency was dead text that only CI and outsiders ever tried to resolve.
+Patch on `[patch.crates-io]` now that the manifest names published versions.
+
+`--features live` needs `rusty_esp_iroh-host`'s `csi` and `core::telemetry`,
+which are not in the published 0.1.0 -- they are on rusty_esp_iroh's
+`w5/csi-stream` branch. The default binary, which is what CI builds and what
+`docs/PERF.md` measures, needs none of it.
+
+The `resolve without the lock` CI job exists to keep both rules honest:
+every other job resolves from the committed lock and so cannot see this
+class of drift at all.
 
 ## Where it runs
 
 On the home computer or any LAN box — not on the device. It reads what the
 device's `csi-stream` output sends (raw I/Q, ~7 KB/s at 50 Hz), so a model
 can be recalibrated or replaced without reflashing anything.
+
+The whole 100-capture Cuenca benchmark runs in about 0.27 s on a 24-thread
+desktop, against 3.7 s single-threaded before optimisation. Every step,
+including the parallelism, is byte-identical: [docs/PERF.md](docs/PERF.md).
 
 The tensors are [candle](https://github.com/huggingface/candle), CPU only.
 `candle-core` 0.11 takes `tokenizers` with its `onig` feature, so a native

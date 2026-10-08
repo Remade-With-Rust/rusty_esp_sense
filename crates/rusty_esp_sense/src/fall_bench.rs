@@ -1,0 +1,446 @@
+//! The fall detector's evidence: false alarms on real captures with no falls
+//! in them, and the state machine on splices of real wander.
+//!
+//! No labelled ESP32 fall recording under a usable licence has been found,
+//! so detection is not measured on real falls. What is measured:
+//!
+//! 1. **The burst threshold's floor**, from the TUNING half of the Cuenca
+//!    captures (odd positions within each scenario): the highest one-second
+//!    wander the on-chip detector reports in any of them -- walking, traffic
+//!    or empty, since none of them is a fall.
+//! 2. **False alarms** of the chip's `FallDetector` on the TEST half, at the
+//!    threshold under test, per hour of real channel state -- and the
+//!    threshold at which the first false alarm on the test half appears, so
+//!    the margin is a number too.
+//! 3. **The state machine on splices** (synthetic, and called so): real
+//!    walking wander, a burst, real empty-room wander -- must raise an event;
+//!    walking then empty with no burst (someone leaving) must not.
+
+use rayon::prelude::*;
+use rusty_esp_signal_core::esp_core::Micros;
+use rusty_esp_signal_core::radar::csi::{Config as DetectorConfig, PresenceDetector};
+use rusty_esp_signal_core::radar::fall::{FallConfig, FallDetector};
+
+use crate::bench::{Recording, Scenario};
+use crate::prof::{self, Counter, Stage};
+
+/// One capture's wander stream: `(at, permille)` per frame.
+pub type Stream = Vec<(Micros, u16)>;
+
+/// The on-chip detector's wander, frame by frame.
+#[must_use]
+pub fn wander_stream(r: &Recording) -> Stream {
+    let _g = prof::scope(Stage::Detector);
+    prof::add(Counter::DetectorPushes, r.capture.samples.len() as u64);
+    prof::add(Counter::FeatureComputations, r.capture.samples.len() as u64);
+    let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
+    let mut out = Vec::with_capacity(r.capture.samples.len());
+    for s in &r.capture.samples {
+        let Ok(f) = s.features() else { continue };
+        det.push(&f.normalised(), s.at);
+        // The window must fill before the wander means anything.
+        if det.warm() {
+            out.push((s.at, det.wander()));
+        }
+    }
+    out
+}
+
+/// The highest wander [`wander_stream`] would report, without the stream.
+#[must_use]
+pub fn wander_peak(r: &Recording) -> u16 {
+    let _g = prof::scope(Stage::Detector);
+    prof::add(Counter::DetectorPushes, r.capture.samples.len() as u64);
+    prof::add(Counter::FeatureComputations, r.capture.samples.len() as u64);
+    let mut det = PresenceDetector::<50>::new(DetectorConfig::normalised_default());
+    let mut peak = 0u16;
+    let mut any = false;
+    for s in &r.capture.samples {
+        let Ok(f) = s.features() else { continue };
+        det.push(&f.normalised(), s.at);
+        if det.warm() {
+            peak = if any {
+                peak.max(det.wander())
+            } else {
+                det.wander()
+            };
+            any = true;
+        }
+    }
+    peak
+}
+
+/// Events a detector with `config` raises over `stream`.
+#[must_use]
+pub fn events(stream: &Stream, config: FallConfig) -> usize {
+    let _g = prof::scope(Stage::Fall);
+    prof::add(Counter::FallPushes, stream.len() as u64);
+    let mut d = FallDetector::new(config);
+    stream
+        .iter()
+        .filter(|(t, w)| d.push(*w, *t).is_some())
+        .count()
+}
+
+/// The `len` consecutive frames of `stream` with the most at or above
+/// `active`.
+fn most_active(stream: &Stream, len: usize, active: u16) -> &[(Micros, u16)] {
+    prof::add(Counter::ActiveScans, 1);
+    if stream.len() <= len {
+        return stream;
+    }
+    let hot = |w: u16| usize::from(w >= active);
+    let mut count: usize = stream[..len].iter().map(|x| hot(x.1)).sum();
+    let (mut best, mut at) = (count, 0);
+    for i in len..stream.len() {
+        count = count + hot(stream[i].1) - hot(stream[i - len].1);
+        if count > best {
+            best = count;
+            at = i + 1 - len;
+        }
+    }
+    &stream[at..at + len]
+}
+
+/// Whether a detector with `config` raises any event over `stream`,
+/// stopping at the first: the sweep asks only that, and [`events`] ran every
+/// stream to its end to count what `> 0` then threw away.
+#[must_use]
+pub fn raises_any(stream: &Stream, config: FallConfig) -> bool {
+    let _g = prof::scope(Stage::Fall);
+    let mut d = FallDetector::new(config);
+    for (i, &(t, w)) in stream.iter().enumerate() {
+        if d.push(w, t).is_some() {
+            prof::add(Counter::FallPushes, i as u64 + 1);
+            return true;
+        }
+    }
+    prof::add(Counter::FallPushes, stream.len() as u64);
+    false
+}
+
+/// What the fall benchmark found.
+#[derive(Debug, Clone)]
+pub struct FallReport {
+    /// Highest wander per scenario on the tuning half.
+    pub tuning_max: Vec<(Scenario, u16)>,
+    /// The threshold under test.
+    pub burst: u16,
+    /// False events on the test half at `burst`.
+    pub false_events: usize,
+    /// Hours of channel state in the test half.
+    pub test_hours: f64,
+    /// The highest threshold at which the test half raises any event (0 if
+    /// none down to the presence threshold).
+    pub first_false_at: u16,
+    /// Splices with a burst that raised an event, of how many.
+    pub splice_falls: (usize, usize),
+    /// Splices without a burst (leaving) that raised one, of how many.
+    pub splice_leaves: (usize, usize),
+}
+
+fn scenario_rank(s: Scenario) -> usize {
+    Scenario::ALL.iter().position(|&x| x == s).unwrap_or(0)
+}
+
+/// Run it. `burst` of `None` uses [`FallConfig::normalised_default`].
+#[must_use]
+pub fn run(recordings: &[Recording], burst: Option<u16>) -> FallReport {
+    // Alternate captures of each scenario, in order, go to the tuning half
+    // and the test half. The halves are assigned first; each capture's
+    // detector pass depends on that capture alone, so the passes run in
+    // parallel and come back in recording order. The tuning half is only
+    // ever asked for its peak, so its streams are reduced as they are made,
+    // not stored.
+    let mut seen = [0usize; 4];
+    let tunes: Vec<bool> = recordings
+        .iter()
+        .map(|r| {
+            let i = scenario_rank(r.scenario);
+            seen[i] += 1;
+            seen[i] % 2 == 0
+        })
+        .collect();
+    let passes: Vec<Result<u16, Stream>> = recordings
+        .par_iter()
+        .zip(&tunes)
+        .map(|(r, &tune)| {
+            if tune {
+                Ok(wander_peak(r))
+            } else {
+                Err(wander_stream(r))
+            }
+        })
+        .collect();
+    let mut tuning: Vec<(Scenario, u16)> = Vec::new();
+    let mut test: Vec<(Scenario, Stream)> = Vec::new();
+    for (r, pass) in recordings.iter().zip(passes) {
+        match pass {
+            Ok(peak) => tuning.push((r.scenario, peak)),
+            Err(stream) => test.push((r.scenario, stream)),
+        }
+    }
+    let tuning_max = Scenario::ALL
+        .iter()
+        .map(|&s| {
+            let m = tuning
+                .iter()
+                .filter(|(x, _)| *x == s)
+                .map(|&(_, peak)| peak)
+                .max()
+                .unwrap_or(0);
+            (s, m)
+        })
+        .collect();
+    let mut config = FallConfig::normalised_default();
+    if let Some(b) = burst {
+        config.burst_permille = b;
+    }
+    let false_events: usize = test.iter().map(|(_, st)| events(st, config)).sum();
+    let test_us: u64 = test
+        .iter()
+        .filter_map(|(_, st)| Some(st.last()?.0.0.saturating_sub(st.first()?.0.0)))
+        .sum();
+    // The margin: walk the threshold down until the test half alarms. The
+    // first threshold walked is the default, just evaluated above.
+    let mut first_false_at = if false_events > 0 {
+        config.burst_permille
+    } else {
+        0
+    };
+    // The burst threshold enters the detector in ONE comparison,
+    // `wander >= burst`, so between two wander values that occur in the test
+    // streams every threshold behaves identically: a threshold `b` acts like
+    // the smallest occurring value at or above it. Walking every integer
+    // down from the default re-ran identical passes; walking the distinct
+    // occurring values below it (each the top of its interval, which is
+    // what the integer walk would have returned) cannot give a different
+    // answer. The one threshold that is not an occurring value, the
+    // default, was evaluated above.
+    if first_false_at == 0 {
+        let mut values: Vec<u16> = test
+            .iter()
+            .flat_map(|(_, st)| st.iter().map(|&(_, w)| w))
+            .filter(|&w| w < config.burst_permille && w > config.active_permille)
+            .collect();
+        values.sort_unstable();
+        values.dedup();
+        // A stream can raise an event at threshold `b` only if one of its
+        // frames reaches `b` (the burst comparison is the only way into an
+        // event), so a stream whose peak is below `b` is skipped for it --
+        // exactly, not heuristically. The empty and traffic captures, which
+        // peak far below any candidate, are never run at all.
+        let peaks: Vec<u16> = test
+            .iter()
+            .map(|(_, st)| st.iter().map(|&(_, w)| w).max().unwrap_or(0))
+            .collect();
+        for &b in values.iter().rev() {
+            let c = FallConfig {
+                burst_permille: b,
+                ..config
+            };
+            if test
+                .iter()
+                .zip(&peaks)
+                .any(|((_, st), &peak)| peak >= b && raises_any(st, c))
+            {
+                first_false_at = b;
+                break;
+            }
+        }
+    }
+    // Splices: each test walking capture's MOST ACTIVE 10 s of wander, then
+    // (or not) a half-second burst above the threshold, then 20 s of a test
+    // empty capture's wander, re-timed to follow on. Most active, not first:
+    // the labels are per capture and a walker is not always in the path --
+    // one capture's first 10 s had no frame above the motion threshold, and
+    // a burst out of stillness is correctly not a fall.
+    let walks: Vec<&Stream> = test
+        .iter()
+        .filter(|(s, _)| *s == Scenario::Walking)
+        .map(|(_, st)| st)
+        .collect();
+    let empties: Vec<&Stream> = test
+        .iter()
+        .filter(|(s, _)| *s == Scenario::Baseline)
+        .map(|(_, st)| st)
+        .collect();
+    let mut splice_falls = (0, 0);
+    let mut splice_leaves = (0, 0);
+    for (k, walk) in walks.iter().enumerate() {
+        let Some(empty) = empties.get(k % empties.len().max(1)) else {
+            break;
+        };
+        // The same stretch for both splices: one scan, not two.
+        let stretch = most_active(walk, 500, config.active_permille);
+        for with_burst in [true, false] {
+            let mut st: Stream = stretch.to_vec();
+            let mut t = st.last().map_or(0, |(t, _)| t.0);
+            if with_burst {
+                for _ in 0..25 {
+                    t += 20_000;
+                    st.push((Micros(t), config.burst_permille.saturating_add(40)));
+                }
+            }
+            let base = empty.first().map_or(0, |(t, _)| t.0);
+            for &(te, w) in empty.iter().take(1000) {
+                st.push((Micros(t + 20_000 + te.0 - base), w));
+            }
+            let raised = events(&st, config) > 0;
+            let tally = if with_burst {
+                &mut splice_falls
+            } else {
+                &mut splice_leaves
+            };
+            tally.1 += 1;
+            if raised {
+                tally.0 += 1;
+            }
+        }
+    }
+    FallReport {
+        tuning_max,
+        burst: config.burst_permille,
+        false_events,
+        test_hours: test_us as f64 / 3.6e9,
+        first_false_at,
+        splice_falls,
+        splice_leaves,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(levels: &[(u64, u16)]) -> Stream {
+        let mut out = Vec::new();
+        let mut k = 0u64;
+        for &(secs, w) in levels {
+            for _ in 0..secs * 50 {
+                out.push((Micros(k * 20_000), w));
+                k += 1;
+            }
+        }
+        out
+    }
+
+    /// R5's oracle: over streams built to put wander values between and on
+    /// the candidate thresholds, the distinct-value walk and the integer walk
+    /// find the same highest alarming threshold.
+    #[test]
+    fn walking_distinct_values_finds_what_walking_every_integer_finds() {
+        let integer_walk = |test: &[Stream], config: FallConfig| -> u16 {
+            let mut b = config.burst_permille;
+            while b > config.active_permille {
+                let c = FallConfig {
+                    burst_permille: b,
+                    ..config
+                };
+                if test.iter().any(|st| events(st, c) > 0) {
+                    return b;
+                }
+                b -= 1;
+            }
+            0
+        };
+        let distinct_walk = |test: &[Stream], config: FallConfig| -> u16 {
+            if test.iter().any(|st| events(st, config) > 0) {
+                return config.burst_permille;
+            }
+            let mut v: Vec<u16> = test
+                .iter()
+                .flat_map(|st| st.iter().map(|&(_, w)| w))
+                .filter(|&w| w < config.burst_permille && w > config.active_permille)
+                .collect();
+            v.sort_unstable();
+            v.dedup();
+            for &b in v.iter().rev() {
+                let c = FallConfig {
+                    burst_permille: b,
+                    ..config
+                };
+                if test.iter().any(|st| events(st, c) > 0) {
+                    return b;
+                }
+            }
+            0
+        };
+        for peak in [40u16, 90, 150, 200, 231, 232, 300] {
+            let test = vec![
+                stream(&[(5, 60), (1, peak), (15, 18)]),
+                stream(&[(3, 45), (1, peak / 2 + 20), (12, 25)]),
+                stream(&[(20, 17)]),
+            ];
+            let c = FallConfig::normalised_default();
+            assert_eq!(
+                integer_walk(&test, c),
+                distinct_walk(&test, c),
+                "peak {peak}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_most_active_stretch_is_where_the_motion_is() {
+        let s = stream(&[(3, 10), (2, 90), (3, 10)]);
+        let seg = most_active(&s, 100, 32);
+        assert!(seg.iter().all(|x| x.1 == 90), "{:?}", &seg[..3]);
+    }
+
+    /// R9's oracle: `raises_any` is `events > 0`, over streams with no
+    /// event, one, and several.
+    #[test]
+    fn raises_any_is_events_above_zero() {
+        let c = FallConfig::normalised_default();
+        let fall = [(5, 60), (1, 400), (15, 18)];
+        let two: Vec<(u64, u16)> = fall
+            .iter()
+            .chain(&[(61, 18)])
+            .chain(&fall)
+            .copied()
+            .collect();
+        for st in [
+            stream(&[(20, 17)]),
+            stream(&[(5, 60), (15, 18)]),
+            stream(&fall),
+            stream(&two),
+        ] {
+            assert_eq!(raises_any(&st, c), events(&st, c) > 0);
+        }
+        assert_eq!(events(&stream(&two), c), 2);
+    }
+
+    /// M10's oracle: the streamed peak is the stream's maximum, on the two
+    /// Cuenca fixtures in rusty_esp_signal (skipped when that checkout is not
+    /// beside this one).
+    #[test]
+    fn the_streamed_peak_is_the_streams_maximum() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../rusty_esp_signal/crates/rusty_esp_signal-core/tests/fixtures/csi");
+        for f in ["c6_empty_room_iter1.csv", "c6_walking_person_iter1.csv"] {
+            let Ok(capture) = crate::capture::read(
+                &dir.join(f),
+                rusty_esp_signal_core::radar::csi_stream::TAG_C6_HT20_NATURAL,
+                20_000,
+            ) else {
+                return;
+            };
+            let r = Recording {
+                scenario: Scenario::Baseline,
+                day: String::new(),
+                capture,
+            };
+            let max = wander_stream(&r).iter().map(|&(_, w)| w).max().unwrap_or(0);
+            assert_eq!(wander_peak(&r), max, "{f}");
+        }
+    }
+
+    #[test]
+    fn events_counts_what_the_chip_detector_raises() {
+        let fall = stream(&[(5, 60), (1, 400), (15, 18)]);
+        assert_eq!(events(&fall, FallConfig::normalised_default()), 1);
+        let leave = stream(&[(5, 60), (15, 18)]);
+        assert_eq!(events(&leave, FallConfig::normalised_default()), 0);
+    }
+}

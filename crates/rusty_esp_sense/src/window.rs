@@ -20,6 +20,8 @@
 //! instead -- presence is second-order, a body makes the channel MOVE, and
 //! a linear readout of centred amplitudes averages that motion away.
 
+use crate::prof::{self, Counter, Stage};
+use rusty_esp_signal_core::radar::csi::Features;
 use rusty_esp_signal_core::radar::csi_stream::Sample;
 
 /// How to cut windows.
@@ -78,59 +80,268 @@ pub struct Windows {
     pub skipped: usize,
 }
 
+/// Windows cut one frame at a time: push each frame's normalised
+/// features, get a window back when one fills. [`windows`] is this over a
+/// run of samples; a caller that also needs the features for something else
+/// (the benchmark's detector, a live stream) computes them once and pushes
+/// them here.
+#[derive(Debug, Clone)]
+pub struct WindowBuilder {
+    cfg: WindowConfig,
+    subcarriers: usize,
+    /// The window being filled, frame-major (`frames × subcarriers`), one
+    /// buffer reused for every window: it was a heap vector per frame.
+    frames: Vec<f32>,
+    /// Frames in `frames`.
+    filled: usize,
+    skipped: usize,
+    /// `wander`'s per-subcarrier means, reused for every window: it was a
+    /// heap vector per window.
+    mean: Vec<f32>,
+}
+
+impl WindowBuilder {
+    /// A builder for `cfg`.
+    #[must_use]
+    pub fn new(cfg: WindowConfig) -> Self {
+        WindowBuilder {
+            cfg,
+            subcarriers: 0,
+            frames: Vec::new(),
+            filled: 0,
+            skipped: 0,
+            mean: Vec::new(),
+        }
+    }
+
+    /// Start a new run: as [`WindowBuilder::new`] with the same config,
+    /// but the frame buffer and the scratch are kept, so a caller cutting
+    /// many recordings allocates them once, not once per recording.
+    pub fn reset(&mut self) {
+        self.subcarriers = 0;
+        self.frames.clear();
+        self.filled = 0;
+        self.skipped = 0;
+    }
+
+    /// Subcarriers per frame, set by the first frame that had any.
+    #[must_use]
+    pub const fn subcarriers(&self) -> usize {
+        self.subcarriers
+    }
+
+    /// Frames skipped so far.
+    #[must_use]
+    pub const fn skipped(&self) -> usize {
+        self.skipped
+    }
+
+    /// One frame: its NORMALISED features, or `None` when they could not be
+    /// computed. The window, when this frame completes one.
+    pub fn push(&mut self, norm: Option<&Features>) -> Option<Vec<f32>> {
+        let mut w = Vec::new();
+        self.push_into(norm, &mut w).then_some(w)
+    }
+
+    /// [`WindowBuilder::push`], appending a completed window to `out`
+    /// instead of returning it in a vector of its own: a caller keeping
+    /// many windows keeps them in one buffer, `width` values each.
+    /// `true` when this frame completed a window.
+    pub fn push_into(&mut self, norm: Option<&Features>, out: &mut Vec<f32>) -> bool {
+        let Some(norm) = norm else {
+            self.skipped += 1;
+            return false;
+        };
+        let amps = norm.amplitudes();
+        if self.subcarriers == 0 {
+            self.subcarriers = amps.len();
+        }
+        if amps.len() != self.subcarriers || amps.is_empty() {
+            self.skipped += 1;
+            return false;
+        }
+        // `normalised` scales so the frame's mean is 1024.
+        let t = self.cfg.frames.max(1);
+        if self.frames.capacity() == 0 {
+            self.frames.reserve_exact(t * self.subcarriers);
+        }
+        self.frames
+            .extend(amps.iter().map(|&a| f32::from(a) / 1024.0));
+        self.filled += 1;
+        prof::add(Counter::FramesWindowed, 1);
+        if self.filled < t {
+            return false;
+        }
+        prof::add(Counter::Windows, 1);
+        if self.cfg.wander {
+            wander_into(&self.frames, t, self.subcarriers, &mut self.mean, out);
+        } else {
+            flatten_into(&self.frames, t, self.subcarriers, self.cfg.centre, out);
+        }
+        self.frames.clear();
+        self.filled = 0;
+        true
+    }
+}
+
 /// Cut `samples` into non-overlapping windows; a partial last window is
 /// dropped.
 #[must_use]
 pub fn windows(samples: &[Sample], cfg: WindowConfig) -> Windows {
-    let t = cfg.frames.max(1);
-    let mut out = Windows::default();
-    let mut frames: Vec<Vec<f32>> = Vec::with_capacity(t);
+    let _g = prof::scope(Stage::Window);
+    prof::add(Counter::FeatureComputations, samples.len() as u64);
+    let mut b = WindowBuilder::new(cfg);
+    let mut data = Vec::new();
     for s in samples {
-        let Ok(f) = s.features() else {
-            out.skipped += 1;
-            continue;
-        };
-        let norm = f.normalised();
-        let amps = norm.amplitudes();
-        if out.subcarriers == 0 {
-            out.subcarriers = amps.len();
-        }
-        if amps.len() != out.subcarriers || amps.is_empty() {
-            out.skipped += 1;
-            continue;
-        }
-        // `normalised` scales so the frame's mean is 1024.
-        frames.push(amps.iter().map(|&a| f32::from(a) / 1024.0).collect());
-        if frames.len() == t {
-            out.data.push(if cfg.wander {
-                wander(&frames, out.subcarriers)
-            } else {
-                flatten(&frames, out.subcarriers, cfg.centre)
-            });
-            frames.clear();
+        let norm = s.features().ok().map(|f| f.normalised());
+        if let Some(w) = b.push(norm.as_ref()) {
+            data.push(w);
         }
     }
+    Windows {
+        subcarriers: b.subcarriers,
+        data,
+        skipped: b.skipped,
+    }
+}
+
+/// The windows of a run of samples in one buffer, `width` values each:
+/// what [`windows`] returns, without a heap vector per window.
+#[derive(Debug, Clone, Default)]
+pub struct FlatWindows {
+    /// Subcarriers per frame (every window has the same).
+    pub subcarriers: usize,
+    /// Every window, one after another.
+    pub data: Vec<f32>,
+    /// Values per window.
+    pub width: usize,
+    /// Windows in `data`.
+    pub count: usize,
+    /// Frames skipped, as [`Windows::skipped`].
+    pub skipped: usize,
+}
+
+impl FlatWindows {
+    /// Each window, in order.
+    pub fn rows(&self) -> core::slice::ChunksExact<'_, f32> {
+        self.data.chunks_exact(self.width.max(1))
+    }
+}
+
+/// [`windows`] into one buffer, sized once from the first frame's width: a
+/// window takes exactly `cfg.frames` frames, so there are at most
+/// `samples / frames` of them.
+#[must_use]
+pub fn windows_flat(samples: &[Sample], cfg: WindowConfig) -> FlatWindows {
+    let _g = prof::scope(Stage::Window);
+    prof::add(Counter::FeatureComputations, samples.len() as u64);
+    let most = samples.len() / cfg.frames.max(1);
+    let mut b = WindowBuilder::new(cfg);
+    let mut data = Vec::new();
+    let mut count = 0usize;
+    for s in samples {
+        let norm = s.features().ok().map(|f| f.normalised());
+        if data.capacity() == 0 {
+            if let Some(f) = &norm {
+                data.reserve_exact(most * cfg.width(f.amplitudes().len()));
+            }
+        }
+        if b.push_into(norm.as_ref(), &mut data) {
+            count += 1;
+        }
+    }
+    FlatWindows {
+        subcarriers: b.subcarriers,
+        width: cfg.width(b.subcarriers),
+        data,
+        count,
+        skipped: b.skipped,
+    }
+}
+
+/// Each subcarrier's standard deviation over the `t` frames of `frames`
+/// (frame-major).
+///
+/// Vertical: every subcarrier's accumulator side by side, advanced one
+/// frame at a time over contiguous rows. Each subcarrier's sums still run
+/// over its frames in order, from the `-0.0` that `Iterator::sum` starts
+/// floats at, so the result is bit for bit the per-subcarrier loops it
+/// replaced -- which walked down the buffer with a stride of `s`.
+#[inline(never)]
+#[cfg(test)]
+fn wander(frames: &[f32], t: usize, s: usize, mean: &mut Vec<f32>) -> Vec<f32> {
+    let mut out = Vec::new();
+    wander_into(frames, t, s, mean, &mut out);
     out
 }
 
-fn wander(frames: &[Vec<f32>], s: usize) -> Vec<f32> {
-    let t = frames.len() as f32;
-    (0..s)
-        .map(|k| {
-            let mean = frames.iter().map(|f| f[k]).sum::<f32>() / t;
-            (frames.iter().map(|f| (f[k] - mean).powi(2)).sum::<f32>() / t).sqrt()
-        })
-        .collect()
+/// Each subcarrier's spread over the window, appended to `out`.
+fn wander_into(frames: &[f32], t: usize, s: usize, mean: &mut Vec<f32>, out: &mut Vec<f32>) {
+    let tf = t as f32;
+    // The caller's scratch, reset to the same starting values each window.
+    mean.clear();
+    mean.resize(s, -0.0);
+    for row in frames.chunks_exact(s).take(t) {
+        add_row(mean, row);
+    }
+    for m in mean.iter_mut() {
+        *m /= tf;
+    }
+    // The spreads accumulate in place at the end of `out`, from the same
+    // starting values (-0.0) the separate vector had.
+    let at = out.len();
+    out.resize(at + s, -0.0);
+    let var = &mut out[at..];
+    for row in frames.chunks_exact(s).take(t) {
+        add_squared_deviations(var, row, mean);
+    }
+    for v in var.iter_mut() {
+        *v = (*v / tf).sqrt();
+    }
 }
 
-fn flatten(frames: &[Vec<f32>], s: usize, centre: bool) -> Vec<f32> {
-    let t = frames.len();
-    let mut w = vec![0f32; s * t];
+/// `acc[k] += row[k]`. Each lane is its own accumulator: nothing is
+/// reassociated. Its own frame on purpose: with `acc` and `row` arriving as
+/// separate non-aliasing parameters the loop vectorises (packed adds);
+/// inlined into [`wander`] the compiler lost that proof and every element
+/// went scalar (census: 30 instructions per eight, all `addss`).
+#[inline(never)]
+fn add_row(acc: &mut [f32], row: &[f32]) {
+    for (a, &r) in acc.iter_mut().zip(row) {
+        *a += r;
+    }
+}
+
+/// `acc[k] += (row[k] - mean[k])²`, as [`add_row`].
+#[inline(never)]
+fn add_squared_deviations(acc: &mut [f32], row: &[f32], mean: &[f32]) {
+    for ((a, &r), &m) in acc.iter_mut().zip(row).zip(mean) {
+        let dev = r - m;
+        *a += dev * dev;
+    }
+}
+
+/// The window subcarrier-major, from `frames` (frame-major).
+#[cfg(test)]
+fn flatten(frames: &[f32], t: usize, s: usize, centre: bool) -> Vec<f32> {
+    let mut w = Vec::with_capacity(s * t);
+    flatten_into(frames, t, s, centre, &mut w);
+    w
+}
+
+/// The window subcarrier-major, appended to `w`.
+#[inline(never)]
+fn flatten_into(frames: &[f32], t: usize, s: usize, centre: bool, w: &mut Vec<f32>) {
+    debug_assert_eq!(frames.len(), t * s);
+    // Appended row by row, each value written once: zero-filling the
+    // window first wrote all of it twice.
+    w.reserve(s * t);
     for k in 0..s {
-        let row = &mut w[k * t..(k + 1) * t];
-        for (j, f) in frames.iter().enumerate() {
-            row[j] = f[k];
-        }
+        // Subcarrier k of every frame. Each frame is an exact chunk of `s`
+        // and `k < s`, so the column read carries no check.
+        let at = w.len();
+        w.extend(frames.chunks_exact(s).map(|f| f[k]));
+        let row = &mut w[at..];
         if centre {
             let mean = row.iter().sum::<f32>() / t as f32;
             for v in row.iter_mut() {
@@ -138,11 +349,94 @@ fn flatten(frames: &[Vec<f32>], s: usize, centre: bool) -> Vec<f32> {
             }
         }
     }
-    w
 }
 
 #[cfg(test)]
 mod tests {
+    /// Q10's oracle: the one-buffer windows are the per-window vectors, bit
+    /// for bit, in every mode, with frames skipped and a partial last
+    /// window dropped.
+    #[test]
+    fn flat_windows_are_the_windows() {
+        use rusty_esp_signal_core::esp_core::Micros;
+        use rusty_esp_signal_core::radar::csi_stream::TAG_LLTF_20MHZ;
+        let samples: Vec<Sample> = (0..157u64)
+            .map(|k| {
+                let mut iq = [0i8; 128];
+                for e in 0..64 {
+                    iq[2 * e] = 20 + ((k as usize * 7 + e * 3) % 11) as i8;
+                    iq[2 * e + 1] = ((k as usize + e) % 5) as i8;
+                }
+                Sample::from_iq(Micros(k * 20_000), -40, 6, TAG_LLTF_20MHZ, &iq).unwrap()
+            })
+            .collect();
+        for (wander, centre) in [(true, true), (false, true), (false, false)] {
+            let cfg = super::WindowConfig {
+                frames: 10,
+                centre,
+                wander,
+            };
+            let a = super::windows(&samples, cfg);
+            let b = super::windows_flat(&samples, cfg);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(b.count, a.data.len());
+            assert_eq!((b.subcarriers, b.skipped), (a.subcarriers, a.skipped));
+            assert_eq!(b.data.len(), b.count * b.width);
+            for (x, y) in a.data.iter().zip(b.rows()) {
+                assert_eq!(bits(x), bits(y), "wander {wander} centre {centre}");
+            }
+        }
+    }
+
+    /// C10's probe: `flatten` as it was (the window zero-filled, then
+    /// written) against the single write, at the raw benchmark's window
+    /// size, over as many windows as the benchmark cuts. Timing, best of N;
+    /// not a gate (the golden hashes are).
+    #[test]
+    #[ignore = "timing probe"]
+    fn probe_flatten_single_write() {
+        fn zero_filled(frames: &[f32], t: usize, s: usize, centre: bool) -> Vec<f32> {
+            let mut w = vec![0f32; s * t];
+            for (k, row) in (0..s).zip(w.chunks_exact_mut(t.max(1))) {
+                for (v, f) in row.iter_mut().zip(frames.chunks_exact(s)) {
+                    *v = f[k];
+                }
+                if centre {
+                    let mean = row.iter().sum::<f32>() / t as f32;
+                    for v in row.iter_mut() {
+                        *v -= mean;
+                    }
+                }
+            }
+            w
+        }
+        let (t, s, windows) = (50usize, 56usize, 5904usize);
+        let frames: Vec<f32> = (0..t * s).map(|i| (i % 97) as f32 / 97.0).collect();
+        for centre in [false, true] {
+            let (mut old, mut new) = (u128::MAX, u128::MAX);
+            for _ in 0..15 {
+                let clock = std::time::Instant::now();
+                let mut keep = Vec::with_capacity(windows);
+                for _ in 0..windows {
+                    keep.push(zero_filled(std::hint::black_box(&frames), t, s, centre));
+                }
+                old = old.min(clock.elapsed().as_micros());
+                let a = std::hint::black_box(keep);
+                let clock = std::time::Instant::now();
+                let mut keep = Vec::with_capacity(windows);
+                for _ in 0..windows {
+                    keep.push(super::flatten(std::hint::black_box(&frames), t, s, centre));
+                }
+                new = new.min(clock.elapsed().as_micros());
+                assert_eq!(a[0], keep[0]);
+            }
+            println!(
+                "probe centre={centre}: zero-filled {old} us, single write {new} us, ratio {:.3}",
+                new as f64 / old as f64
+            );
+        }
+    }
+
     use rusty_esp_signal_core::esp_core::Micros;
     use rusty_esp_signal_core::radar::csi_stream::{TAG_LLTF_20MHZ, TAG_UNKNOWN};
 
@@ -224,6 +518,40 @@ mod tests {
         );
         assert_eq!(w.skipped, 1);
         assert_eq!(w.data.len(), 1);
+    }
+
+    /// V6's oracle: the vertical wander equals the per-subcarrier iterator
+    /// sums it replaced, bit for bit, over sizes and values that include
+    /// exact zeros.
+    #[test]
+    fn vertical_wander_matches_the_per_subcarrier_sums() {
+        let reference = |frames: &[f32], t: usize, s: usize| -> Vec<f32> {
+            let tf = t as f32;
+            (0..s)
+                .map(|k| {
+                    let at = |j: usize| frames[j * s + k];
+                    let mean = (0..t).map(at).sum::<f32>() / tf;
+                    ((0..t).map(|j| (at(j) - mean).powi(2)).sum::<f32>() / tf).sqrt()
+                })
+                .collect()
+        };
+        for (t, s) in [(1, 1), (2, 3), (50, 56), (50, 52), (7, 64), (100, 56)] {
+            let frames: Vec<f32> = (0..t * s)
+                .map(|i| {
+                    if i % 11 == 0 {
+                        0.0
+                    } else {
+                        ((i * 2_654_435_761) % 4096) as f32 / 1024.0
+                    }
+                })
+                .collect();
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&wander(&frames, t, s, &mut Vec::new())),
+                bits(&reference(&frames, t, s)),
+                "t {t} s {s}"
+            );
+        }
     }
 
     #[test]

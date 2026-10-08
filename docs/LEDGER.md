@@ -108,3 +108,71 @@ does not refuse traffic; calibrate with the room's normal traffic running.
 `--features live`; fmt. `watch` (the live subscriber) compiles against the
 W5 branches (`rusty_esp_iroh` #4, `rusty_esp_signal` #9) through the
 umbrella patch; it has not run against a device.
+
+---
+
+## W7: falls and nights — 2026-09-24
+
+### Fall (`bench-fall`; the detector is `rusty_esp_signal-core::radar::fall`)
+
+No labelled ESP32 fall recording under a usable licence exists that we
+found: the three GitHub candidates carry no licence, and the one with a
+`data/raw` folder names its files `sample_synth_…`. So the Cuenca captures
+were split in halves within each scenario — tuning and test — and the
+thresholds set on the tuning half only.
+
+| tuning half, highest one-second wander | ‰ |
+|---|---:|
+| E1 empty | 28 |
+| E2 walking | 178 |
+| E3 empty + traffic | 35 |
+| E4 walking + traffic | 138 |
+
+Defaults: burst 232 ‰ (1.3 × 178), still 30 ‰ (above 28), active 32 ‰.
+
+| test half | result |
+|---|---|
+| 0.84 h of channel state, no falls in it | **0 false events** (95 %: < ~3.6 / h) |
+| first false event, walking the threshold down | at **114 ‰** |
+| SYNTHETIC splices: the capture's most active 10 s → 0.5 s burst → 20 s empty room | **10 / 10** raised |
+| SYNTHETIC splices: most active 10 s → empty room, no burst (leaving) | **0 / 10** raised |
+
+Three corrections on the way, all visible in the code's history: motion
+ended on the first dip between steps (1 / 10 splices caught); "still" first
+reused the presence detector's 23 ‰, below the tuning half's empty ceiling
+(the default moved to 30 ‰ from the tuning half); and the splices took each
+walking capture's FIRST 10 s, one of which held no frame of motion — a burst
+out of stillness, correctly refused. Instrumenting the misses, not moving a
+threshold, is what found the third.
+
+### Night (`night`, `bench-night`)
+
+30 s epochs: the fraction of frames the on-chip detector calls moving, and
+the breathing estimator's accepted rate if any. Awake when Cole–Kripke's
+weighted motion (their relative weights, four epochs back and two ahead)
+is at least 2 %; otherwise asleep when a breath was accepted within three
+epochs either side, empty when not. The 2 % is a parameter, not a
+validated figure; Cole–Kripke fitted wrist accelerometers.
+
+`bench-night`, each scenario's captures played end to end:
+
+| scenario | epochs | empty | awake | asleep |
+|---|---:|---:|---:|---:|
+| E1 empty | 31 | 31 | 0 | 0 |
+| E2 walking | 41 | 0 | 41 | 0 |
+| E3 empty + traffic | 91 | 91 | 0 | 0 |
+| E4 walking + traffic | 40 | 0 | 40 | 0 |
+
+The first rule (empty = motion exactly zero, no breath) scored **2 of 91**
+traffic epochs asleep: traffic peaks at 35 ‰, just over the motion
+threshold. Asking for the absence of motion was the wrong question; asking
+for the presence of a breath is the right one. That correction is judged on
+the same data that exposed it.
+
+Not claimed: the asleep path on real data (no breath was accepted in any
+scenario — none of them has a still, breathing person), and any sleep stage.
+
+### Gates
+
+27 unit tests; clippy `-D warnings` with and without `live`; fmt;
+`cargo deny`.
